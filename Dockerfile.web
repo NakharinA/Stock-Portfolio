@@ -5,10 +5,10 @@ WORKDIR /app
 # Dependencies are installed into the image so a fresh clone needs no local Node.
 # The compose file masks /app/node_modules with an anonymous volume, which keeps the
 # bind-mounted source from hiding what was installed here.
-COPY package.json ./
-RUN npm install
+COPY package.json yarn.lock ./
+RUN yarn install --frozen-lockfile
 
 COPY . .
 
 EXPOSE 5173
-CMD ["npm", "run", "dev"]
+CMD ["yarn", "dev"]

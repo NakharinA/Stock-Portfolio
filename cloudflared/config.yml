@@ -1,0 +1,15 @@
+# Which hostname reaches which container. This file is the whole reverse proxy: a service
+# that is not named here has no route in from the internet, whatever ports it publishes.
+tunnel: 7dc337d7-1da1-476c-b222-cf3bd215768a
+credentials-file: /etc/cloudflared/credentials.json
+
+ingress:
+  - hostname: port.pueyleng.com
+    service: http://web:5173
+
+  - hostname: port-api.pueyleng.com
+    service: http://api:3000
+
+  # Required last rule: anything not matched above is refused rather than falling through
+  # to whichever service happens to answer.
+  - service: http_status:404

@@ -17,3 +17,6 @@ __pycache__
 
 # Local backups taken before destructive runs.
 backup-*/
+
+# Cloudflare tunnel private key.
+cloudflared/credentials.json

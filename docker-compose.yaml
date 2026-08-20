@@ -1,23 +1,84 @@
 services:
-  # The dashboard itself, on http://localhost:5173
+  # ---------------------------------------------------------------- public services
+  # Reachable from the internet through the Cloudflare tunnel. Everything else below is
+  # bound to 127.0.0.1 and stays on this machine.
+
+  # The dashboard, at https://port.pueyleng.com
   web:
     build:
       context: .
       dockerfile: Dockerfile.web
     ports:
-      - "5173:5173"
+      - "127.0.0.1:5173:5173"
     volumes:
-      # Source is bind-mounted so edits show up without a rebuild; data/prices.json
-      # written by the `prices` service lands here too and is picked up on reload.
       - .:/app
-      # Anonymous volume: keeps the image's node_modules from being shadowed by the host,
-      # which has none.
       - /app/node_modules
     restart: unless-stopped
 
-  # Long-running price fetcher: writes data/prices.json at 20:30, 00:00 and 03:00
-  # Asia/Bangkok -- US market open, midnight, and US market close.
-  # One-off refresh outside the schedule: docker compose run --rm prices python get_prices.py
+  # The NestJS API, at https://port-api.pueyleng.com
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    env_file:
+      - ./backend/.env
+    environment:
+      # Overrides the host-facing value in backend/.env: inside the compose network the
+      # database answers to its service name, not to localhost.
+      DATABASE_URL: postgresql://portfolio:portfolio@db:5432/portfolio
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - ./backend:/app
+      - /app/node_modules
+      # Read-only: the one-shot import of the pre-database JSON files reads from here and
+      # must never be able to write back to them.
+      - ./data:/app/legacy-data:ro
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------- private services
+
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: portfolio
+      POSTGRES_PASSWORD: portfolio
+      POSTGRES_DB: portfolio
+    ports:
+      # 5434 because 5432 and 5433 are already taken on this machine. Published only so
+      # prisma migrate can run from the host; never exposed through the tunnel.
+      - "127.0.0.1:5434:5432"
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U portfolio -d portfolio"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # The original single-user Python API. It holds a Gmail grant and has no authentication
+  # of its own, so it must never appear in the tunnel's ingress rules.
+  legacy-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.ingest
+    command: uvicorn server:app --host 0.0.0.0 --port 8000
+    env_file:
+      - .env
+    ports:
+      - "127.0.0.1:8000:8000"
+      - "127.0.0.1:8765:8765"
+    volumes:
+      - ./inbox:/app/inbox
+      - ./data:/app/data
+      - ./credentials:/app/credentials
+    restart: unless-stopped
+
+  # Price fetcher on the 20:30 / 00:00 / 03:00 Asia/Bangkok schedule.
   prices:
     build:
       context: .
@@ -29,27 +90,8 @@ services:
       RUN_ON_START: "1"
     restart: unless-stopped
 
-  # Local API behind the dashboard: Gmail consent and "fetch new trades" from the browser.
-  # Bound to 127.0.0.1 only -- it has no auth of its own and holds the mailbox grant.
-  api:
-    build:
-      context: .
-      dockerfile: Dockerfile.ingest
-    command: uvicorn server:app --host 0.0.0.0 --port 8000
-    env_file:
-      - .env
-    ports:
-      # The OAuth consent callback lands here, from the browser on the host.
-      - "127.0.0.1:8765:8765"
-    volumes:
-      - ./inbox:/app/inbox
-      - ./data:/app/data
-      - ./credentials:/app/credentials
-    restart: unless-stopped
-
-  # PDF confirmations -> data/transactions.json. On demand, not on a schedule:
-  #   docker compose run --rm ingest python fetch_email.py     pull PDFs from Gmail
-  #   docker compose run --rm ingest python import_txs.py      parse them into the store
+  # On-demand PDF import from a terminal:
+  #   docker compose run --rm ingest python import_txs.py
   ingest:
     build:
       context: .
@@ -59,8 +101,27 @@ services:
     volumes:
       - ./inbox:/app/inbox
       - ./data:/app/data
-      # Writable: auth_gmail.py stores token.json here, and fetch_email.py rewrites it
-      # whenever Google rotates the refresh token.
       - ./credentials:/app/credentials
     profiles:
       - tools
+
+  # ---------------------------------------------------------------- edge
+  # The tunnel is the only way in. Nothing is port-forwarded and no origin certificate is
+  # needed: cloudflared dials out to Cloudflare, and Cloudflare terminates TLS.
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    command: tunnel --config /etc/cloudflared/config.yml run
+    volumes:
+      - ./cloudflared:/etc/cloudflared:ro
+    depends_on:
+      - web
+      - api
+    restart: unless-stopped
+    # Behind a profile so it is opt-in: without cloudflared/credentials.json it would
+    # restart-loop, and nothing should reach the internet by accident.
+    #   docker compose --profile edge up -d
+    profiles:
+      - edge
+
+volumes:
+  db-data:

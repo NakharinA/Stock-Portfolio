@@ -1,6 +1,8 @@
 import { useState, useEffect, useMemo, useCallback } from "react";
 import { Plus, Trash2, TrendingUp, TrendingDown, Wallet, Coins, RefreshCw, ChevronDown, ChevronUp, X, Eye, EyeOff } from "lucide-react";
 import { BarChart, Bar, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine, Cell, LabelList } from "recharts";
+import { api } from "./src/api";
+import { useAuth } from "./src/auth";
 
 const FONT_LINK = "https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600;9..144,700&family=Noto+Sans+Thai:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap";
 
@@ -39,46 +41,6 @@ const MASK = "•••";
 
 const EMPTY_TX = { date: "", ticker: "", type: "buy", qty: "", price: "", fee: "0" };
 
-// Year-end closing prices, like everything else about this portfolio, come from a file.
-const YEAR_END_PRICES_URL = "./year_end_prices.json";
-
-const DIVIDENDS_URL = "./dividends.json";
-
-// Buys and sells now come from the broker's own confirmation notes, imported by
-// import_txs.py -- the numbers there are the broker's, down to the seventh decimal and
-// including the per-trade fees that the old hardcoded list left at zero. Trades that no
-// confirmation note covers live in the manual file alongside the dividends.
-const TRANSACTIONS_URL = "./transactions.json";
-const MANUAL_TX_URL = "./manual_transactions.json";
-
-async function fetchRows(url, keep) {
-  try {
-    const res = await fetch(url, { cache: "no-store" });
-    if (!res.ok) return null;
-    const raw = await res.json();
-    const list = Array.isArray(raw) ? raw : raw.transactions;
-    if (!Array.isArray(list)) return null;
-    return list.filter((t) => t && t.id && (!keep || keep(t)));
-  } catch (e) {
-    return null;
-  }
-}
-
-// Accepts either the current wrapped shape ({ fetched_at, prices }) or a bare { TICKER: price }
-// map, which is what older versions of get_prices.py wrote. Non-numeric entries are dropped
-// rather than allowed through as NaN, which would silently poison every downstream total.
-function parsePricesFile(raw) {
-  if (!raw || typeof raw !== "object") return null;
-  const source = raw.prices && typeof raw.prices === "object" ? raw.prices : raw;
-  const prices = {};
-  for (const [ticker, value] of Object.entries(source)) {
-    const n = parseFloat(value);
-    if (isFinite(n) && n > 0) prices[ticker.toUpperCase()] = n;
-  }
-  if (Object.keys(prices).length === 0) return null;
-  return { prices, fetchedAt: typeof raw.fetched_at === "string" ? raw.fetched_at : null };
-}
-
 export default function PortfolioDashboard() {
   const [txs, setTxs] = useState([]);
   const [prices, setPrices] = useState({});
@@ -89,9 +51,9 @@ export default function PortfolioDashboard() {
   const [showLog, setShowLog] = useState(true);
   const [error, setError] = useState("");
   const [savingNote, setSavingNote] = useState("");
-  const [priceSource, setPriceSource] = useState(null); // { label, fetchedAt } once prices.json is read
+  const [priceSource, setPriceSource] = useState(null); // { label, fetchedAt } for the price banner
   const [hideAmounts, setHideAmounts] = useState(false);
-  // Years whose closing prices came from the file need no input UI.
+  // Years the server already has closing prices for need no input UI.
   const [yearEndFromFile, setYearEndFromFile] = useState({});
 
   // Bump this whenever the canonical row set changes shape, so every browser reconciles to
@@ -99,152 +61,59 @@ export default function PortfolioDashboard() {
   // version 5 is the move off the hardcoded list onto the broker's own confirmation notes.
   const SEED_RECONCILE_VERSION = "5";
 
-  // load from storage, reconciling against the canonical seed list by fixed id
+  // Everything about the portfolio comes from the API, which scopes every row to the
+  // signed-in account. Nothing is read from disk and nothing is seeded into the browser.
+  const load = useCallback(async () => {
+    setError("");
+    try {
+      const [rows, priceData, yearEnd] = await Promise.all([api.transactions(), api.prices(), api.yearEndPrices()]);
+      setTxs(rows);
+      setPrices(priceData.prices);
+      setPriceSource(priceData.fetchedAt ? { label: "ราคาตลาด", fetchedAt: priceData.fetchedAt } : null);
+      setYearEndPrices(yearEnd);
+      setYearEndFromFile(yearEnd);
+    } catch (e) {
+      setError(e.message || "โหลดข้อมูลไม่สำเร็จ");
+    } finally {
+      setLoaded(true);
+    }
+  }, []);
+
   useEffect(() => {
+    void load();
+
+    // Display preferences stay in the browser: they say nothing about the portfolio and
+    // are per-device by nature.
     (async () => {
-      let existing = [];
-      try {
-        const t = await window.storage.get("transactions");
-        if (t && t.value) existing = JSON.parse(t.value);
-      } catch (e) {}
-
-      let seedVersion = null;
-      try {
-        const v = await window.storage.get("seed-version");
-        if (v && v.value) seedVersion = v.value;
-      } catch (e) {}
-
-      // The canonical list is now three files, and reconciling against a partial copy of it
-      // would delete whatever failed to load. So all three have to arrive before anything is
-      // dropped; if any is missing, storage is left exactly as it is.
-      const [importedRows, dividendRows, manualRows] = await Promise.all([
-        fetchRows(TRANSACTIONS_URL),
-        fetchRows(DIVIDENDS_URL, (t) => t.type === "dividend"),
-        fetchRows(MANUAL_TX_URL),
-      ]);
-      const filesLoaded = importedRows !== null && dividendRows !== null && manualRows !== null;
-
-      const allSeed = filesLoaded ? [...importedRows, ...dividendRows, ...manualRows] : [];
-      let finalTxs;
-      let needsSave = false;
-
-      if (seedVersion !== SEED_RECONCILE_VERSION && filesLoaded) {
-        // Full reconciliation: drop anything that looks like an old/duplicate seed entry
-        // (random-id rows from before fixed ids existed, or stale seed ids), keep only
-        // genuinely user-added rows (ids starting with "u-"), then re-add the canonical seed.
-        const userAdded = existing.filter((t) => typeof t.id === "string" && t.id.startsWith("u-"));
-        finalTxs = [...allSeed, ...userAdded];
-        needsSave = true;
-      } else {
-        // Already reconciled, or the files are unreachable: keep what is in storage and top
-        // up with any rows the files have gained since (a fresh import, a new dividend).
-        const existingIds = new Set(existing.map((t) => t.id));
-        const missing = allSeed.filter((t) => !existingIds.has(t.id));
-        finalTxs = missing.length > 0 ? [...existing, ...missing] : existing;
-        needsSave = missing.length > 0;
-      }
-
-      setTxs(finalTxs);
-      if (needsSave) {
-        try {
-          await window.storage.set("transactions", JSON.stringify(finalTxs));
-          await window.storage.set("seed-version", SEED_RECONCILE_VERSION);
-        } catch (e) {}
-      }
-
-      // Prices: whatever the user typed stays, and prices.json overwrites the tickers it
-      // covers -- it comes from get_prices.py and is by definition fresher. A missing or
-      // malformed file leaves the stored prices untouched rather than blanking them.
-      let existingPrices = {};
-      try {
-        const p = await window.storage.get("current-prices");
-        if (p && p.value) existingPrices = JSON.parse(p.value);
-      } catch (e) {}
-
-      let fromFile = null;
-      try {
-        const res = await fetch(PRICES_URL, { cache: "no-store" });
-        if (res.ok) fromFile = parsePricesFile(await res.json());
-      } catch (e) {}
-
-      const mergedPrices = fromFile ? { ...existingPrices, ...fromFile.prices } : existingPrices;
-      setPrices(mergedPrices);
-      if (fromFile) {
-        setPriceSource({ label: "prices.json", fetchedAt: fromFile.fetchedAt });
-        try {
-          await window.storage.set("current-prices", JSON.stringify(mergedPrices));
-        } catch (e) {}
-      }
-
-      // Year-end prices work the same way: the file fills in years and tickers the user has
-      // not entered by hand, and never overwrites one that was.
-      let yearEndFromFile = {};
-      try {
-        const res = await fetch(YEAR_END_PRICES_URL, { cache: "no-store" });
-        if (res.ok) {
-          const raw = await res.json();
-          const years = raw && raw.years ? raw.years : raw;
-          if (years && typeof years === "object") yearEndFromFile = years;
-        }
-      } catch (e) {}
-
-      let existingYearEndPrices = {};
-      try {
-        const yep = await window.storage.get("year-end-prices");
-        if (yep && yep.value) existingYearEndPrices = JSON.parse(yep.value);
-      } catch (e) {}
-
-      let yepChanged = false;
-      const mergedYearEndPrices = { ...existingYearEndPrices };
-      for (const [year, tickerPrices] of Object.entries(yearEndFromFile)) {
-        mergedYearEndPrices[year] = mergedYearEndPrices[year] || {};
-        for (const [ticker, price] of Object.entries(tickerPrices)) {
-          if (mergedYearEndPrices[year][ticker] === undefined) {
-            mergedYearEndPrices[year][ticker] = price;
-            yepChanged = true;
-          }
-        }
-      }
-      setYearEndPrices(mergedYearEndPrices);
-      setYearEndFromFile(yearEndFromFile);
-      if (yepChanged) {
-        try {
-          await window.storage.set("year-end-prices", JSON.stringify(mergedYearEndPrices));
-        } catch (e) {}
-      }
-
       try {
         const h = await window.storage.get("hide-amounts");
         if (h && h.value === "1") setHideAmounts(true);
       } catch (e) {}
-
-      setLoaded(true);
     })();
-  }, []);
+  }, [load]);
 
-  const persistTxs = useCallback(async (next) => {
-    setTxs(next);
+  const persistPrices = useCallback(async (next, ticker) => {
+    setPrices(next);
+    const value = parseFloat(next[ticker]);
+    if (!isFinite(value) || value <= 0) return;
     try {
-      await window.storage.set("transactions", JSON.stringify(next));
-      setSavingNote("บันทึกแล้ว");
+      await api.setPrice(ticker, value);
+      setSavingNote("บันทึกราคาแล้ว");
       setTimeout(() => setSavingNote(""), 1200);
     } catch (e) {
-      setSavingNote("บันทึกไม่สำเร็จ");
+      setSavingNote("บันทึกราคาไม่สำเร็จ");
     }
   }, []);
 
-  const persistPrices = useCallback(async (next) => {
-    setPrices(next);
-    try {
-      await window.storage.set("current-prices", JSON.stringify(next));
-    } catch (e) {}
-  }, []);
-
-  const persistYearEndPrices = useCallback(async (next) => {
+  const persistYearEndPrices = useCallback(async (next, year, ticker) => {
     setYearEndPrices(next);
+    const value = parseFloat(next[year]?.[ticker]);
+    if (!isFinite(value) || value <= 0) return;
     try {
-      await window.storage.set("year-end-prices", JSON.stringify(next));
-    } catch (e) {}
+      await api.setYearEndPrice(ticker, year, value);
+    } catch (e) {
+      setSavingNote("บันทึกราคาปิดสิ้นปีไม่สำเร็จ");
+    }
   }, []);
 
   const toggleHideAmounts = useCallback(async () => {
@@ -261,31 +130,42 @@ export default function PortfolioDashboard() {
   const moneySigned = useCallback((n, digits = 2) => (hideAmounts ? MASK : fmtSigned(n, digits) + "$"), [hideAmounts]);
   const shares = useCallback((n) => (hideAmounts ? MASK : fmt(n, n % 1 === 0 ? 0 : 2)), [hideAmounts]);
 
-  const addTx = () => {
+  const addTx = async () => {
     setError("");
     if (!form.date || !form.ticker || !form.qty || (form.type !== "dividend" && !form.price)) {
       setError("กรอกข้อมูลให้ครบ: วันที่, หุ้น, จำนวน" + (form.type !== "dividend" ? ", ราคา" : ""));
       return;
     }
-    const ticker = form.ticker.trim().toUpperCase();
-    const newTx = {
-      id: "u-" + uid(),
-      date: form.date,
-      ticker,
-      type: form.type,
-      qty: parseFloat(form.qty) || 0,
-      price: form.type === "dividend" ? 0 : parseFloat(form.price) || 0,
-      fee: parseFloat(form.fee) || 0,
-      // for dividend: qty field holds the total USD received
-    };
-    const next = [...txs, newTx].sort((a, b) => a.date.localeCompare(b.date));
-    persistTxs(next);
-    setForm({ ...EMPTY_TX, ticker: "" });
-    setShowForm(false);
+
+    try {
+      const created = await api.createTransaction({
+        date: form.date,
+        ticker: form.ticker.trim().toUpperCase(),
+        type: form.type,
+        // For a dividend this field carries the cash received, which the API stores as an
+        // amount rather than as a share count.
+        qty: parseFloat(form.qty) || 0,
+        price: form.type === "dividend" ? 0 : parseFloat(form.price) || 0,
+        fee: parseFloat(form.fee) || 0,
+      });
+      setTxs((current) => [...current, created].sort((a, b) => a.date.localeCompare(b.date)));
+      setForm({ ...EMPTY_TX, ticker: "" });
+      setShowForm(false);
+      setSavingNote("บันทึกแล้ว");
+      setTimeout(() => setSavingNote(""), 1200);
+    } catch (e) {
+      setError(e.message || "บันทึกไม่สำเร็จ");
+    }
   };
 
-  const deleteTx = (id) => {
-    persistTxs(txs.filter((t) => t.id !== id));
+  const deleteTx = async (id) => {
+    setError("");
+    try {
+      await api.deleteTransaction(id);
+      setTxs((current) => current.filter((t) => t.id !== id));
+    } catch (e) {
+      setError(e.message || "ลบไม่สำเร็จ");
+    }
   };
 
   // core portfolio math: weighted average cost method
@@ -801,7 +681,7 @@ export default function PortfolioDashboard() {
           />
         </div>
 
-        <IngestPanel />
+        <AccountBar onImported={load} />
 
         {error && (
           <div style={{ background: "#2A1A1A", border: `1px solid ${COLORS.loss}`, color: COLORS.loss, padding: "8px 12px", borderRadius: 6, fontSize: 13, marginBottom: 14 }}>
@@ -960,10 +840,14 @@ export default function PortfolioDashboard() {
                               placeholder="ราคา"
                               value={(yearEndPrices[year] && yearEndPrices[year][ticker]) ?? ""}
                               onChange={(e) =>
-                                persistYearEndPrices({
-                                  ...yearEndPrices,
-                                  [year]: { ...(yearEndPrices[year] || {}), [ticker]: e.target.value },
-                                })
+                                persistYearEndPrices(
+                                  {
+                                    ...yearEndPrices,
+                                    [year]: { ...(yearEndPrices[year] || {}), [ticker]: e.target.value },
+                                  },
+                                  year,
+                                  ticker,
+                                )
                               }
                             />
                           </div>
@@ -1064,7 +948,7 @@ export default function PortfolioDashboard() {
                       style={{ width: 90, padding: "5px 7px" }}
                       placeholder="ใส่ราคา"
                       value={prices[r.ticker] ?? ""}
-                      onChange={(e) => persistPrices({ ...prices, [r.ticker]: e.target.value })}
+                      onChange={(e) => persistPrices({ ...prices, [r.ticker]: e.target.value }, r.ticker)}
                     />
                   </td>
                   <td>{r.currentValue !== null ? money(r.currentValue, 0) : "-"}</td>
@@ -1163,154 +1047,58 @@ export default function PortfolioDashboard() {
   );
 }
 
-// Talks to the local ingest API (server.py) through the dev server's /api proxy. When the
-// API is not running -- the dashboard opened as a plain artifact, say -- every call fails
-// and the panel hides itself rather than showing dead buttons.
-function IngestPanel() {
-  const [status, setStatus] = useState(null);
-  const [job, setJob] = useState(null);
-  const [authUrl, setAuthUrl] = useState(null);
+// Account strip: who is signed in, and the one-off move of the pre-database JSON files
+// into this account. The old ingest panel that drove the Python API is gone -- fetching
+// mail now belongs on the server, per account, not in the browser.
+function AccountBar({ onImported }) {
+  const { user, signOut } = useAuth();
+  const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
 
-  const refresh = useCallback(async () => {
-    try {
-      const res = await fetch("/api/status");
-      if (!res.ok) throw new Error("api");
-      setStatus(await res.json());
-    } catch (e) {
-      setStatus(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    refresh();
-  }, [refresh]);
-
-  // While a job runs, poll it; when it finishes, reload so the dashboard picks up the
-  // rows that were just written to disk.
-  useEffect(() => {
-    if (!job || job.state !== "running") return;
-    const timer = setInterval(async () => {
-      try {
-        const res = await fetch("/api/job");
-        const next = await res.json();
-        setJob(next);
-        if (next.state === "done") {
-          setMessage("อัปเดตแล้ว กำลังโหลดหน้าใหม่");
-          setTimeout(() => window.location.reload(), 800);
-        } else if (next.state === "error") {
-          setMessage("");
-        }
-      } catch (e) {}
-    }, 1500);
-    return () => clearInterval(timer);
-  }, [job]);
-
-  const post = async (path) => {
+  const importLegacy = async () => {
+    setBusy(true);
     setMessage("");
     try {
-      const res = await fetch(path, { method: "POST" });
-      const body = await res.json();
-      if (!res.ok) {
-        setMessage(body.error || "เรียกไม่สำเร็จ");
-        return null;
-      }
-      return body;
+      const summary = await api.importLegacy();
+      const { read, inserted, skipped } = summary.transactions;
+      setMessage(`อ่าน ${read} แถว เพิ่มใหม่ ${inserted} ซ้ำ ${skipped} · ราคา ${summary.prices} ตัว`);
+      await onImported();
     } catch (e) {
-      setMessage("ต่อ API ไม่ได้");
-      return null;
+      setMessage(e.message || "นำเข้าไม่สำเร็จ");
+    } finally {
+      setBusy(false);
     }
   };
 
-  const startSync = async () => {
-    const body = await post("/api/sync");
-    if (body) setJob({ state: "running", kind: "sync", log: [] });
-  };
-
-  const startPrices = async () => {
-    const body = await post("/api/prices");
-    if (body) setJob({ state: "running", kind: "prices", log: [] });
-  };
-
-  const startAuth = async () => {
-    const body = await post("/api/auth/start");
-    if (!body || !body.url) return;
-    setAuthUrl(body.url);
-    window.open(body.url, "_blank", "noopener");
-    const timer = setInterval(async () => {
-      try {
-        const res = await fetch("/api/auth/state");
-        const state = await res.json();
-        if (state.authorised) {
-          clearInterval(timer);
-          setAuthUrl(null);
-          setMessage("เชื่อมต่อ Gmail แล้ว");
-          refresh();
-        } else if (state.state === "error") {
-          clearInterval(timer);
-          setMessage(state.error || "อนุญาตไม่สำเร็จ");
-        }
-      } catch (e) {}
-    }, 2000);
-  };
-
-  if (status === null || status === false) return null;
-
-  const running = job && job.state === "running";
-  const counts = status.counts;
+  if (!user) return null;
 
   return (
-    <div style={{ background: COLORS.panel, border: `1px solid ${COLORS.panelLine}`, borderRadius: 10, padding: "12px 14px", marginBottom: 22 }}>
-      <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
-        <div style={{ fontSize: 12.5, color: COLORS.muted, flex: 1, minWidth: 220 }}>
-          {counts.transactions} รายการจากใบยืนยัน · {counts.dividends} ปันผล · {counts.manual} กรอกเอง
-          {status.prices_fetched_at ? ` · ราคา ${status.prices_fetched_at.slice(0, 16).replace("T", " ")}` : ""}
-        </div>
-
-        {status.authorised ? (
-          <button className="pf-btn" onClick={startSync} disabled={running}>
-            <RefreshCw size={15} /> {running && job.kind === "sync" ? "กำลังดึง..." : "ดึงรายการใหม่จากเมล"}
-          </button>
-        ) : (
-          <button className="pf-btn" onClick={startAuth} disabled={!status.client_configured}>
-            <Eye size={15} /> เชื่อมต่อ Gmail
-          </button>
-        )}
-
-        <button className="pf-btn-ghost" onClick={startPrices} disabled={running}>
-          <Coins size={15} /> {running && job.kind === "prices" ? "กำลังอัปเดต..." : "อัปเดตราคา"}
-        </button>
+    <div
+      style={{
+        background: COLORS.panel,
+        border: `1px solid ${COLORS.panelLine}`,
+        borderRadius: 10,
+        padding: "10px 14px",
+        marginBottom: 22,
+        display: "flex",
+        alignItems: "center",
+        gap: 10,
+        flexWrap: "wrap",
+      }}
+    >
+      <div style={{ fontSize: 12.5, color: COLORS.muted, flex: 1, minWidth: 200 }}>
+        {user.email}
+        {user.gmailConnected ? " · เชื่อมต่อ Gmail แล้ว" : " · ยังไม่ได้ให้สิทธิ์อ่านเมล"}
       </div>
 
-      {!status.client_configured && (
-        <div style={{ fontSize: 11.5, color: COLORS.loss, marginTop: 8 }}>
-          ยังไม่มี credentials/oauth_client.json — สร้าง OAuth client แบบ Desktop app แล้ววางไฟล์ไว้ที่นั่น
-        </div>
-      )}
+      {message && <span style={{ fontSize: 11.5, color: COLORS.muted }}>{message}</span>}
 
-      {authUrl && (
-        <div style={{ fontSize: 11.5, color: COLORS.muted, marginTop: 8 }}>
-          ถ้าหน้าต่างไม่เปิดขึ้นมา{" "}
-          <a href={authUrl} target="_blank" rel="noopener noreferrer" style={{ color: COLORS.gold }}>
-            กดที่นี่เพื่ออนุญาต
-          </a>
-        </div>
-      )}
-
-      {message && <div style={{ fontSize: 11.5, color: COLORS.muted, marginTop: 8 }}>{message}</div>}
-
-      {job && job.error && (
-        <pre className="pf-mono" style={{ fontSize: 11, color: COLORS.loss, marginTop: 8, whiteSpace: "pre-wrap" }}>{job.error}</pre>
-      )}
-
-      {job && job.log && job.log.length > 0 && (
-        <pre
-          className="pf-mono pf-scroll"
-          style={{ fontSize: 11, color: COLORS.muted, marginTop: 8, maxHeight: 160, overflowY: "auto", whiteSpace: "pre-wrap" }}
-        >
-          {job.log.join("\n")}
-        </pre>
-      )}
+      <button className="pf-btn-ghost" onClick={importLegacy} disabled={busy}>
+        <RefreshCw size={15} /> {busy ? "กำลังนำเข้า..." : "นำเข้าข้อมูลเดิม"}
+      </button>
+      <button className="pf-btn-ghost" onClick={signOut}>
+        ออกจากระบบ
+      </button>
     </div>
   );
 }

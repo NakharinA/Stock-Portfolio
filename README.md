@@ -14,15 +14,55 @@ cp .env.example .env          # then fill in PDF_PASSWORD and GMAIL_QUERY
 docker compose up -d          # dashboard on http://localhost:5173
 ```
 
-`docker compose up` starts three services:
+`docker compose up -d` starts:
 
-| Service | What it does |
+| Service | What it does | Reachable at |
+|---|---|---|
+| `web` | The dashboard (Vite dev server) | 127.0.0.1:5173 |
+| `api` | The NestJS backend — users, auth, transactions | 127.0.0.1:3000 |
+| `db` | Postgres 17 | 127.0.0.1:5434 |
+| `legacy-api` | The original single-user Python API | 127.0.0.1:8000 |
+| `prices` | Fetches prices at 20:30, 00:00 and 03:00 Asia/Bangkok | — |
+
+Everything binds to 127.0.0.1. `ingest` (terminal imports) and `cloudflared` (the tunnel)
+sit behind profiles and only start when asked for.
+
+Database migrations:
+
+```
+docker compose exec api npx prisma migrate deploy
+```
+
+## Publishing it
+
+`cloudflared` is the only route in from the internet — no ports are forwarded and no
+origin certificate is needed. `cloudflared/config.yml` is the routing table:
+
+| Hostname | Goes to |
 |---|---|
-| `web` | The dashboard (Vite dev server) on port 5173 |
-| `api` | Local API for the dashboard's Gmail buttons |
-| `prices` | Fetches prices at 20:30, 00:00 and 03:00 Asia/Bangkok |
+| `port.pueyleng.com` | `web:5173` |
+| `port-api.pueyleng.com` | `api:3000` |
 
-`ingest` is a fourth, on-demand service for running the import from a terminal.
+A service not named in that file has no route in, whatever it publishes locally. That is
+deliberate for `legacy-api`, which holds a Gmail grant and has no authentication.
+
+Setup lives in `cloudflared/README.md`. Once `cloudflared/credentials.json` is in place:
+
+```
+docker compose --profile edge up -d
+```
+
+### DNS records
+
+`cloudflared tunnel route dns` creates these; by hand they are:
+
+| Type | Name | Content | Proxy |
+|---|---|---|---|
+| CNAME | `port` | `<TUNNEL-UUID>.cfargotunnel.com` | Proxied (orange cloud) |
+| CNAME | `port-api` | `<TUNNEL-UUID>.cfargotunnel.com` | Proxied (orange cloud) |
+
+Both must be proxied: a grey-cloud record points at a hostname that does not resolve
+publicly, and the tunnel is what makes it reachable. No A record and no port forwarding.
 
 ## Getting trades in
 
