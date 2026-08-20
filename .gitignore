@@ -1,0 +1,16 @@
+# Personal data -- never commit.
+# Portfolio holdings, prices and transaction history.
+data/
+# Broker confirmation PDFs and their extracted text.
+inbox/
+# OAuth client secret and refresh token.
+credentials/
+# PDF password and Gmail query.
+.env
+
+# Build artefacts.
+node_modules
+dist
+__pycache__
+*.pyc
+.DS_Store

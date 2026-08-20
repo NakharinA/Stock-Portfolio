@@ -1,0 +1,66 @@
+services:
+  # The dashboard itself, on http://localhost:5173
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+    ports:
+      - "5173:5173"
+    volumes:
+      # Source is bind-mounted so edits show up without a rebuild; data/prices.json
+      # written by the `prices` service lands here too and is picked up on reload.
+      - .:/app
+      # Anonymous volume: keeps the image's node_modules from being shadowed by the host,
+      # which has none.
+      - /app/node_modules
+    restart: unless-stopped
+
+  # Long-running price fetcher: writes data/prices.json at 20:30, 00:00 and 03:00
+  # Asia/Bangkok -- US market open, midnight, and US market close.
+  # One-off refresh outside the schedule: docker compose run --rm prices python get_prices.py
+  prices:
+    build:
+      context: .
+      dockerfile: Dockerfile.prices
+    volumes:
+      - ./data:/app/data
+    environment:
+      SCHEDULE_TZ: Asia/Bangkok
+      RUN_ON_START: "1"
+    restart: unless-stopped
+
+  # Local API behind the dashboard: Gmail consent and "fetch new trades" from the browser.
+  # Bound to 127.0.0.1 only -- it has no auth of its own and holds the mailbox grant.
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.ingest
+    command: uvicorn server:app --host 0.0.0.0 --port 8000
+    env_file:
+      - .env
+    ports:
+      # The OAuth consent callback lands here, from the browser on the host.
+      - "127.0.0.1:8765:8765"
+    volumes:
+      - ./inbox:/app/inbox
+      - ./data:/app/data
+      - ./credentials:/app/credentials
+    restart: unless-stopped
+
+  # PDF confirmations -> data/transactions.json. On demand, not on a schedule:
+  #   docker compose run --rm ingest python fetch_email.py     pull PDFs from Gmail
+  #   docker compose run --rm ingest python import_txs.py      parse them into the store
+  ingest:
+    build:
+      context: .
+      dockerfile: Dockerfile.ingest
+    env_file:
+      - .env
+    volumes:
+      - ./inbox:/app/inbox
+      - ./data:/app/data
+      # Writable: auth_gmail.py stores token.json here, and fetch_email.py rewrites it
+      # whenever Google rotates the refresh token.
+      - ./credentials:/app/credentials
+    profiles:
+      - tools

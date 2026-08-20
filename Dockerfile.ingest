@@ -1,0 +1,16 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+RUN pip install --no-cache-dir \
+      pdfplumber \
+      yfinance \
+      google-api-python-client \
+      google-auth \
+      google-auth-oauthlib \
+      fastapi \
+      uvicorn
+
+COPY tx_store.py pdf_extract.py parse_rules.py import_txs.py fetch_email.py auth_gmail.py get_prices.py server.py ./
+
+CMD ["python", "import_txs.py"]

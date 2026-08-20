@@ -1,0 +1,15 @@
+{
+  "note": "Dividends, maintained by hand -- confirmation notes do not carry them.",
+  "count": 1,
+  "transactions": [
+    {
+      "id": "d-example001",
+      "date": "2026-03-02",
+      "ticker": "AAPL",
+      "type": "dividend",
+      "qty": 1.25,
+      "price": 0.0,
+      "fee": 0.0
+    }
+  ]
+}

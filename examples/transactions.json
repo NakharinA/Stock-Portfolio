@@ -1,0 +1,28 @@
+{
+  "note": "Written by import_txs.py. Copy to data/transactions.json only as a starting point.",
+  "count": 2,
+  "transactions": [
+    {
+      "date": "2026-01-02",
+      "ticker": "AAPL",
+      "type": "buy",
+      "qty": 1.0,
+      "price": 100.0,
+      "fee": 0.1,
+      "order_id": "000000",
+      "id": "i-example001",
+      "source": "example.pdf"
+    },
+    {
+      "date": "2026-02-02",
+      "ticker": "AAPL",
+      "type": "sell",
+      "qty": 0.5,
+      "price": 120.0,
+      "fee": 0.1,
+      "order_id": "000001",
+      "id": "i-example002",
+      "source": "example.pdf"
+    }
+  ]
+}
