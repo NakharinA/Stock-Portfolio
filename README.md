@@ -21,6 +21,7 @@ docker compose up -d          # dashboard on http://localhost:5173
 | `web` | The dashboard (Vite dev server) | 127.0.0.1:5173 |
 | `api` | The NestJS backend — users, auth, transactions | 127.0.0.1:3000 |
 | `db` | Postgres 17 | 127.0.0.1:5434 |
+| `parser` | Stateless PDF parser the API calls | internal only |
 | `legacy-api` | The original single-user Python API | 127.0.0.1:8000 |
 | `prices` | Fetches prices at 20:30, 00:00 and 03:00 Asia/Bangkok | — |
 
@@ -65,6 +66,23 @@ Both must be proxied: a grey-cloud record points at a hostname that does not res
 publicly, and the tunnel is what makes it reachable. No A record and no port forwarding.
 
 ## Getting trades in
+
+Signed in, the dashboard does the whole thing: **ดึงรายการใหม่จากเมล** starts a server-side
+job that reads the mailbox, sends each confirmation note to the parser, and writes the
+trades to that account. The browser only watches the job, so closing the tab does not
+abandon it.
+
+| Endpoint | Does |
+|---|---|
+| `PUT /api/settings/broker` | Store the PDF password (encrypted) and the Gmail query |
+| `POST /api/ingest/sync` | Start a sync; returns the job |
+| `GET /api/ingest/jobs/:id` | Progress and log of one job |
+| `POST /api/legacy-import` | One-off move of the pre-database JSON files into an account |
+
+Row ids are a hash of the trade, and the TypeScript and Python importers compute it the
+same way, so a note imported by either path is never imported twice.
+
+### The old terminal route
 
 The dashboard has a panel with **เชื่อมต่อ Gmail** and **ดึงรายการใหม่จากเมล**, which is
 the whole flow. It needs an OAuth client first:

@@ -1,6 +1,7 @@
 import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
 import PortfolioDashboard from "../portfolio_dashboard.jsx";
 import { AuthProvider, useAuth } from "./auth";
+import ErrorBoundary from "./ErrorBoundary";
 import Login from "./routes/Login";
 import ProtectedRoute from "./routes/ProtectedRoute";
 
@@ -21,7 +22,9 @@ export default function App() {
             path="/"
             element={
               <ProtectedRoute>
-                <PortfolioDashboard />
+                <ErrorBoundary>
+                  <PortfolioDashboard />
+                </ErrorBoundary>
               </ProtectedRoute>
             }
           />

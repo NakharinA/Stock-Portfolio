@@ -1,5 +1,5 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
-import { api, clearToken, getToken, setToken } from "./api";
+import { api, ApiError, clearToken, getToken, setToken } from "./api";
 
 const AuthContext = createContext(null);
 
@@ -21,6 +21,7 @@ function takeTokenFromUrl() {
 export function AuthProvider({ children }) {
   const [user, setUser] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [unreachable, setUnreachable] = useState(false);
 
   const load = useCallback(async () => {
     takeTokenFromUrl();
@@ -31,11 +32,19 @@ export function AuthProvider({ children }) {
     }
     try {
       setUser(await api.me());
-    } catch {
-      // An expired or revoked token is indistinguishable from no token as far as the UI
-      // is concerned: either way this person has to sign in again.
-      clearToken();
-      setUser(null);
+      setUnreachable(false);
+    } catch (e) {
+      // Only a token the server actively rejects is thrown away. A restarted API, a dropped
+      // connection or a 500 says nothing about whether this person is signed in, and
+      // deleting the session over one is what makes an app ask for a login every time
+      // anything hiccups.
+      if (e instanceof ApiError && (e.status === 401 || e.status === 403)) {
+        clearToken();
+        setUser(null);
+        setUnreachable(false);
+      } else {
+        setUnreachable(true);
+      }
     } finally {
       setLoading(false);
     }
@@ -50,7 +59,10 @@ export function AuthProvider({ children }) {
     setUser(null);
   }, []);
 
-  const value = useMemo(() => ({ user, loading, signOut, reload: load }), [user, loading, signOut, load]);
+  const value = useMemo(
+    () => ({ user, loading, unreachable, signOut, reload: load }),
+    [user, loading, unreachable, signOut, load],
+  );
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 }
 

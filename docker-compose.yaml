@@ -26,6 +26,8 @@ services:
       # Overrides the host-facing value in backend/.env: inside the compose network the
       # database answers to its service name, not to localhost.
       DATABASE_URL: postgresql://portfolio:portfolio@db:5432/portfolio
+      PARSER_URL: http://parser:8100
+      QUOTES_URL: http://quotes:8200
     ports:
       - "127.0.0.1:3000:3000"
     volumes:
@@ -37,6 +39,10 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      parser:
+        condition: service_started
+      quotes:
+        condition: service_started
     restart: unless-stopped
 
   # ---------------------------------------------------------------- private services
@@ -76,6 +82,25 @@ services:
       - ./inbox:/app/inbox
       - ./data:/app/data
       - ./credentials:/app/credentials
+    restart: unless-stopped
+
+  # Stateless PDF parser. Holds no credentials and no mailbox access: the API sends it a
+  # confirmation note and the password to open it, and gets the trades back. Not published
+  # to the host and not in the tunnel's ingress rules -- only the API talks to it.
+  parser:
+    build:
+      context: .
+      dockerfile: Dockerfile.ingest
+    command: uvicorn parser_service:app --host 0.0.0.0 --port 8100
+    restart: unless-stopped
+
+  # Current prices, on request. Stateless like the parser: it is told which tickers to
+  # look up and answers with what the market says, nothing more.
+  quotes:
+    build:
+      context: .
+      dockerfile: Dockerfile.ingest
+    command: uvicorn quotes_service:app --host 0.0.0.0 --port 8200
     restart: unless-stopped
 
   # Price fetcher on the 20:30 / 00:00 / 03:00 Asia/Bangkok schedule.

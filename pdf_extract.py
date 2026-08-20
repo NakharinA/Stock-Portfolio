@@ -25,9 +25,18 @@ def password():
 
 def extract(path):
     """Return {"text": str, "tables": [[[cell, ...], ...], ...]} for one PDF."""
+    return extract_with_password(Path(path), password())
+
+
+def extract_with_password(path, pdf_password):
+    """Same, with the password passed in rather than read from the environment.
+
+    The HTTP parser service takes a password per request, because it serves several
+    accounts and none of their passwords belong in its environment.
+    """
     path = Path(path)
     try:
-        with pdfplumber.open(path, password=password()) as pdf:
+        with pdfplumber.open(path, password=pdf_password) as pdf:
             pages_text = []
             tables = []
             for page in pdf.pages:

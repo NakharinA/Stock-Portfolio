@@ -7,6 +7,8 @@ import { PricesModule } from './prices/prices.module';
 import { PrismaModule } from './prisma/prisma.module';
 import { TransactionsModule } from './transactions/transactions.module';
 import { UsersModule } from './users/users.module';
+import { IngestModule } from './ingest/ingest.module';
+import { SettingsModule } from './settings/settings.module';
 
 @Module({
   imports: [
@@ -18,6 +20,8 @@ import { UsersModule } from './users/users.module';
     TransactionsModule,
     PricesModule,
     LegacyImportModule,
+    IngestModule,
+    SettingsModule,
   ],
 })
 export class AppModule {}

@@ -55,6 +55,8 @@ export default function PortfolioDashboard() {
   const [hideAmounts, setHideAmounts] = useState(false);
   // Years the server already has closing prices for need no input UI.
   const [yearEndFromFile, setYearEndFromFile] = useState({});
+  const [backfilling, setBackfilling] = useState(false);
+  const [backfillNote, setBackfillNote] = useState("");
 
   // Bump this whenever the canonical row set changes shape, so every browser reconciles to
   // the files instead of holding on to rows from an earlier version of this dashboard --
@@ -129,6 +131,23 @@ export default function PortfolioDashboard() {
   const money = useCallback((n, digits = 2) => (hideAmounts ? MASK : fmt(n, digits) + "$"), [hideAmounts]);
   const moneySigned = useCallback((n, digits = 2) => (hideAmounts ? MASK : fmtSigned(n, digits) + "$"), [hideAmounts]);
   const shares = useCallback((n) => (hideAmounts ? MASK : fmt(n, n % 1 === 0 ? 0 : 2)), [hideAmounts]);
+
+  // Year-end closes are market history, so they can be looked up rather than typed. Only
+  // the gaps are filled: a figure already stored, including one entered by hand, is left.
+  const backfillYearEnd = async () => {
+    setBackfilling(true);
+    setBackfillNote("");
+    try {
+      const result = await api.backfillYearEndPrices();
+      const failed = result.failed?.length ? ` · ไม่พบราคา ${result.failed.join(", ")}` : "";
+      setBackfillNote(result.filled > 0 ? `เติมราคาปิดสิ้นปีให้ ${result.filled} รายการ${failed}` : `ไม่มีรายการที่ต้องเติม${failed}`);
+      await load();
+    } catch (e) {
+      setBackfillNote(e.message || "ดึงราคาปิดสิ้นปีไม่สำเร็จ");
+    } finally {
+      setBackfilling(false);
+    }
+  };
 
   const addTx = async () => {
     setError("");
@@ -400,6 +419,10 @@ export default function PortfolioDashboard() {
         isYTD,
         unrealizedGainInYear,
         missingTickers,
+        // Any year missing a price is understated, not just a past one: the unrealized part
+        // drops out of the numerator while the denominator still counts every baht put in.
+        // The current year used to be exempt from this flag, which hid exactly that.
+        missingPrices: missingTickers.length > 0,
         needsYearEndPrices: !isYTD && missingTickers.length > 0,
         ...d,
       };
@@ -773,6 +796,22 @@ export default function PortfolioDashboard() {
             <div style={{ fontSize: 11, color: COLORS.muted, marginBottom: 10 }}>
               กำไรที่ขายจริง + ปันผล + การเปลี่ยนแปลงของกำไร/ขาดทุนที่ยังไม่ขาย (เทียบราคาปิดสิ้นปีก่อนหน้ากับสิ้นปีนี้ ไม่นับซ้ำข้ามปี) เทียบกับเงินลงทุนที่ใส่เข้าไปในปีนั้น — ปีปัจจุบันแปลงเป็นอัตราเทียบเท่ารายปีตามสัดส่วนวันที่ผ่านมาแล้ว
             </div>
+            {yearlyReturns.some((r) => r.isYTD && r.missingPrices) && (
+              <div
+                style={{
+                  background: "#2A1A1A",
+                  border: `1px solid ${COLORS.loss}`,
+                  color: COLORS.loss,
+                  padding: "8px 12px",
+                  borderRadius: 6,
+                  fontSize: 12,
+                  marginBottom: 10,
+                }}
+              >
+                ผลตอบแทนปีนี้ต่ำกว่าความเป็นจริง — ยังไม่รวมกำไร/ขาดทุนที่ยังไม่ขาย เพราะขาดราคาปัจจุบันของ{" "}
+                {yearlyReturns.find((r) => r.isYTD).missingTickers.join(", ")} · กดปุ่ม “ดึงราคาล่าสุด” ด้านบน
+              </div>
+            )}
             <div style={{ background: COLORS.panel, border: `1px solid ${COLORS.panelLine}`, borderRadius: 10, padding: "14px 8px 6px" }}>
               <ResponsiveContainer width="100%" height={Math.max(120, yearlyReturns.length * 50)}>
                 <BarChart data={yearlyReturns} layout="vertical" margin={{ top: 5, right: 50, left: 8, bottom: 0 }}>
@@ -795,6 +834,8 @@ export default function PortfolioDashboard() {
                       const lines = [fmtSigned(p.annualizedPct, 1) + "%" + (p.isYTD ? " (เทียบเท่ารายปี)" : "")];
                       if (p.isYTD) lines.push(`ตามจริง ณ วันนี้: ${fmtSigned(p.simplePct, 1)}%`);
                       if (p.needsYearEndPrices) lines.push(`ยังไม่รวม unrealized — ขาดราคาปิด: ${p.missingTickers.join(", ")}`);
+                      else if (p.missingPrices)
+                        lines.push(`ตัวเลขต่ำกว่าจริง — ยังไม่รวม unrealized เพราะขาดราคาปัจจุบันของ ${p.missingTickers.join(", ")} (กดดึงราคาล่าสุด)`);
                       return [lines.join(" · "), "ผลตอบแทน"];
                     }}
                   />
@@ -804,13 +845,13 @@ export default function PortfolioDashboard() {
                       <Cell
                         key={i}
                         fill={r.annualizedPct >= 0 ? COLORS.gain : COLORS.loss}
-                        fillOpacity={r.needsYearEndPrices ? 0.4 : r.isYTD ? 0.75 : 1}
+                        fillOpacity={r.missingPrices ? 0.4 : r.isYTD ? 0.75 : 1}
                       />
                     ))}
                     <LabelList
                       dataKey="annualizedPct"
                       position="right"
-                      formatter={(v, entry) => fmtSigned(v, 1) + "%" + (entry && entry.needsYearEndPrices ? "*" : "")}
+                      formatter={(v, entry) => fmtSigned(v, 1) + "%" + (entry && entry.missingPrices ? "*" : "")}
                       style={{ fill: COLORS.paper, fontSize: 12, fontFamily: "'IBM Plex Mono', monospace" }}
                     />
                   </Bar>
@@ -819,9 +860,16 @@ export default function PortfolioDashboard() {
 
               {Object.keys(yearEndHoldingsNeeded).length > 0 && (
                 <div style={{ marginTop: 10, paddingTop: 10, borderTop: `1px solid ${COLORS.panelLine}` }}>
-                  <div style={{ fontSize: 11, color: COLORS.muted, marginBottom: 8 }}>
-                    * ยังไม่รวมกำไร/ขาดทุนที่ยังไม่ขายของปีนั้น เพราะขาดราคาปิด ณ 31 ธ.ค. — กรอกได้เลยครับ:
+                  <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8, flexWrap: "wrap" }}>
+                    <div style={{ fontSize: 11, color: COLORS.muted, flex: 1, minWidth: 240 }}>
+                      * ยังไม่รวมกำไร/ขาดทุนที่ยังไม่ขายของปีนั้น เพราะขาดราคาปิด ณ 31 ธ.ค. —
+                      กดดึงอัตโนมัติ หรือกรอกเองก็ได้:
+                    </div>
+                    <button className="pf-btn-ghost" onClick={backfillYearEnd} disabled={backfilling}>
+                      <RefreshCw size={14} /> {backfilling ? "กำลังดึง..." : "ดึงราคาปิดสิ้นปีอัตโนมัติ"}
+                    </button>
                   </div>
+                  {backfillNote && <div style={{ fontSize: 11, color: COLORS.muted, marginBottom: 8 }}>{backfillNote}</div>}
                   {Object.entries(yearEndHoldingsNeeded).map(([year, tickers]) => (
                     <div key={year} style={{ marginBottom: 8 }}>
                       <div className="pf-mono" style={{ fontSize: 11, color: COLORS.gold, marginBottom: 4 }}>
@@ -1047,58 +1095,142 @@ export default function PortfolioDashboard() {
   );
 }
 
-// Account strip: who is signed in, and the one-off move of the pre-database JSON files
-// into this account. The old ingest panel that drove the Python API is gone -- fetching
-// mail now belongs on the server, per account, not in the browser.
+// Account strip: who is signed in, the broker settings a sync needs, and the sync itself.
+// Fetching mail runs on the server now, per account -- the browser only starts the job and
+// watches it, so closing the tab does not abandon a half-finished import.
 function AccountBar({ onImported }) {
   const { user, signOut } = useAuth();
+  const [settings, setSettings] = useState(null);
+  const [password, setPassword] = useState("");
+  const [job, setJob] = useState(null);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
 
-  const importLegacy = async () => {
+  useEffect(() => {
+    api
+      .brokerSettings()
+      .then(setSettings)
+      .catch(() => setSettings(null));
+  }, []);
+
+  // A sync is a background job on the server, so its progress is polled rather than
+  // awaited. Polling stops as soon as the job reaches a final state.
+  useEffect(() => {
+    if (!job || job.state !== "RUNNING") return;
+    const timer = setInterval(async () => {
+      try {
+        const next = await api.job(job.id);
+        setJob(next);
+        if (next.state !== "RUNNING") {
+          setBusy(false);
+          await onImported();
+        }
+      } catch (e) {
+        clearInterval(timer);
+        setBusy(false);
+      }
+    }, 2000);
+    return () => clearInterval(timer);
+  }, [job, onImported]);
+
+  const savePassword = async () => {
+    setMessage("");
+    try {
+      setSettings(await api.saveBrokerSettings({ pdfPassword: password }));
+      setPassword("");
+      setMessage("บันทึกรหัสแล้ว");
+    } catch (e) {
+      setMessage(e.message || "บันทึกไม่สำเร็จ");
+    }
+  };
+
+  const refreshPrices = async () => {
     setBusy(true);
     setMessage("");
     try {
-      const summary = await api.importLegacy();
-      const { read, inserted, skipped } = summary.transactions;
-      setMessage(`อ่าน ${read} แถว เพิ่มใหม่ ${inserted} ซ้ำ ${skipped} · ราคา ${summary.prices} ตัว`);
+      const result = await api.refreshPrices();
+      const failed = result.failed?.length ? ` · ไม่ได้ราคา ${result.failed.join(", ")}` : "";
+      setMessage(`อัปเดตราคา ${result.updated} ตัว${failed}`);
       await onImported();
     } catch (e) {
-      setMessage(e.message || "นำเข้าไม่สำเร็จ");
+      // The cooldown answer carries how long is left, which is the only useful thing to
+      // say back -- "try again later" without a number is not an answer.
+      const wait = e.body?.retryAfterSeconds;
+      setMessage(wait ? `ดึงราคาได้อีกครั้งในอีก ${wait} วินาที` : e.message || "ดึงราคาไม่สำเร็จ");
     } finally {
       setBusy(false);
+    }
+  };
+
+  const startSync = async () => {
+    setBusy(true);
+    setMessage("");
+    try {
+      setJob(await api.startSync());
+    } catch (e) {
+      setBusy(false);
+      setMessage(e.message || "เริ่มงานไม่สำเร็จ");
     }
   };
 
   if (!user) return null;
 
   return (
-    <div
-      style={{
-        background: COLORS.panel,
-        border: `1px solid ${COLORS.panelLine}`,
-        borderRadius: 10,
-        padding: "10px 14px",
-        marginBottom: 22,
-        display: "flex",
-        alignItems: "center",
-        gap: 10,
-        flexWrap: "wrap",
-      }}
-    >
-      <div style={{ fontSize: 12.5, color: COLORS.muted, flex: 1, minWidth: 200 }}>
-        {user.email}
-        {user.gmailConnected ? " · เชื่อมต่อ Gmail แล้ว" : " · ยังไม่ได้ให้สิทธิ์อ่านเมล"}
+    <div style={{ background: COLORS.panel, border: `1px solid ${COLORS.panelLine}`, borderRadius: 10, padding: "12px 14px", marginBottom: 22 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+        <div style={{ fontSize: 12.5, color: COLORS.muted, flex: 1, minWidth: 200 }}>
+          {user.email}
+          {user.gmailConnected ? " · เชื่อมต่อ Gmail แล้ว" : " · ยังไม่ได้ให้สิทธิ์อ่านเมล"}
+        </div>
+
+        {message && <span style={{ fontSize: 11.5, color: COLORS.muted }}>{message}</span>}
+
+        <button className="pf-btn" onClick={startSync} disabled={busy || !settings?.pdfPasswordSet}>
+          <RefreshCw size={15} /> {busy && job ? "กำลังดึง..." : "ดึงรายการใหม่จากเมล"}
+        </button>
+        <button className="pf-btn-ghost" onClick={refreshPrices} disabled={busy}>
+          <Coins size={15} /> ดึงราคาล่าสุด
+        </button>
+        <button className="pf-btn-ghost" onClick={signOut}>
+          ออกจากระบบ
+        </button>
       </div>
 
-      {message && <span style={{ fontSize: 11.5, color: COLORS.muted }}>{message}</span>}
+      {settings && !settings.pdfPasswordSet && (
+        <div style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 10, flexWrap: "wrap" }}>
+          <span style={{ fontSize: 11.5, color: COLORS.loss }}>
+            ใส่รหัสเปิดไฟล์ PDF ของโบรกก่อนถึงจะดึงเมลได้ — เก็บแบบเข้ารหัส ไม่ถูกส่งกลับมาแสดงอีก
+          </span>
+          <input
+            type="password"
+            className="pf-input"
+            style={{ maxWidth: 200 }}
+            placeholder="รหัสเปิด PDF"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+          />
+          <button className="pf-btn-ghost" onClick={savePassword} disabled={!password}>
+            บันทึก
+          </button>
+        </div>
+      )}
 
-      <button className="pf-btn-ghost" onClick={importLegacy} disabled={busy}>
-        <RefreshCw size={15} /> {busy ? "กำลังนำเข้า..." : "นำเข้าข้อมูลเดิม"}
-      </button>
-      <button className="pf-btn-ghost" onClick={signOut}>
-        ออกจากระบบ
-      </button>
+      {job && (
+        <div style={{ marginTop: 10 }}>
+          <div style={{ fontSize: 11.5, color: job.state === "ERROR" ? COLORS.loss : COLORS.muted }}>
+            สถานะ: {job.state}
+            {job.error ? ` — ${job.error}` : ""}
+          </div>
+          {job.log?.length > 0 && (
+            <pre
+              className="pf-mono pf-scroll"
+              style={{ fontSize: 11, color: COLORS.muted, marginTop: 6, maxHeight: 160, overflowY: "auto", whiteSpace: "pre-wrap" }}
+            >
+              {job.log.join("\n")}
+            </pre>
+          )}
+        </div>
+      )}
     </div>
   );
 }

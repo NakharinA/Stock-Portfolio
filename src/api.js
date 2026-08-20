@@ -119,5 +119,13 @@ export const api = {
   setYearEndPrice: (ticker, year, price) =>
     request(`/prices/year-end/${ticker}`, { method: "PUT", body: { year: Number(year), price } }),
 
-  importLegacy: () => request("/legacy-import", { method: "POST" }),
+  brokerSettings: () => request("/settings/broker"),
+  saveBrokerSettings: (body) => request("/settings/broker", { method: "PUT", body }),
+
+  refreshPrices: () => request("/prices/refresh", { method: "POST" }),
+
+  backfillYearEndPrices: () => request("/prices/year-end/backfill", { method: "POST" }),
+
+  startSync: () => request("/ingest/sync", { method: "POST" }),
+  job: (id) => request(`/ingest/jobs/${id}`),
 };
