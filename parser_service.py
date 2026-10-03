@@ -7,8 +7,11 @@ password to open it, and answers with the trades inside. Everything about *whose
 is -- the Gmail grant, the account it belongs to, what has already been imported -- stays
 in the API, where the database is.
 
-    POST /parse   multipart: file=<pdf>, password=<str>
-                  -> { "rows": [...], "source": "<filename>" }
+    POST /parse       multipart: file=<pdf>, password=<str>
+                      -> { "rows": [...], "source": "<filename>" }
+
+    POST /statement   multipart: file=<pdf>, password=<str>
+                      -> { "statement": { as_of, total_balance, cash_balance, ... } | null, "source": "<filename>" }
 
 Reachable only from inside the compose network; it is not in the tunnel's ingress rules.
 """
@@ -20,6 +23,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 
 import parse_rules
 import pdf_extract
+import statement_rules
 
 app = FastAPI(title="confirmation-note-parser")
 
@@ -29,8 +33,7 @@ def health():
     return {"status": "ok"}
 
 
-@app.post("/parse")
-async def parse(file: UploadFile = File(...), password: str = Form(...)):
+async def _extract(file, password):
     payload = await file.read()
     if not payload:
         raise HTTPException(status_code=400, detail="empty file")
@@ -41,10 +44,14 @@ async def parse(file: UploadFile = File(...), password: str = Form(...)):
         handle.write(payload)
         handle.flush()
         try:
-            extracted = pdf_extract.extract_with_password(Path(handle.name), password)
+            return pdf_extract.extract_with_password(Path(handle.name), password)
         except pdf_extract.LockedPdfError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+
+@app.post("/parse")
+async def parse(file: UploadFile = File(...), password: str = Form(...)):
+    extracted = await _extract(file, password)
     filename = file.filename or "upload.pdf"
     try:
         rows = parse_rules.parse_confirmation(extracted, filename)
@@ -56,3 +63,17 @@ async def parse(file: UploadFile = File(...), password: str = Form(...)):
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     return {"rows": rows, "skipped": False, "source": filename}
+
+
+@app.post("/statement")
+async def statement(file: UploadFile = File(...), password: str = Form(...)):
+    extracted = await _extract(file, password)
+    filename = file.filename or "upload.pdf"
+    try:
+        result = statement_rules.parse_statement(extracted["text"])
+    except statement_rules.NotAStatement as exc:
+        # A statement with no offshore account (mutual funds only): nothing to read, not a failure.
+        return {"statement": None, "skipped": True, "reason": str(exc), "source": filename}
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"statement": result, "skipped": False, "source": filename}

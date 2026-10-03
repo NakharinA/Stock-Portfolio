@@ -19,7 +19,7 @@ docker compose up -d          # dashboard on http://localhost:5173
 | Service | What it does | Reachable at |
 |---|---|---|
 | `web` | The dashboard (Vite dev server) | 127.0.0.1:5173 |
-| `api` | The NestJS backend — users, auth, transactions | 127.0.0.1:3000 |
+| `api` | The NestJS backend — users, auth, transactions | 127.0.0.1:3003 |
 | `db` | Postgres 17 | 127.0.0.1:5434 |
 | `parser` | Stateless PDF parser the API calls | internal only |
 | `legacy-api` | The original single-user Python API | 127.0.0.1:8000 |

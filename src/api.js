@@ -105,6 +105,12 @@ export const api = {
     return { prices: byTicker, fetchedAt: latest };
   },
 
+  /** { start, end, history: { ticker: { "YYYY-MM-DD": close } }, failed } */
+  priceHistory: () => request("/prices/history"),
+
+  /** Monthly statements: [{ asOf, totalBalance, cashBalance, dividendsSinceStart, holdings }] */
+  statements: () => request("/statements"),
+
   setPrice: (ticker, price) => request(`/prices/${ticker}`, { method: "PUT", body: { price } }),
 
   async yearEndPrices() {

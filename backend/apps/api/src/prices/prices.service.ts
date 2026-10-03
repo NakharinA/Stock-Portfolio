@@ -14,6 +14,17 @@ export interface PriceView {
 /** How long a user must wait between price refreshes. */
 export const REFRESH_COOLDOWN_MS = 5 * 60 * 1000;
 
+/** How long a fetched price history is reused before Yahoo is asked again. */
+export const HISTORY_CACHE_MS = 6 * 60 * 60 * 1000;
+
+export interface PriceHistoryView {
+  start: string;
+  end: string;
+  /** ticker -> ISO day -> close */
+  history: Record<string, Record<string, number>>;
+  failed: string[];
+}
+
 export interface RefreshResult {
   updated: number;
   tickers: string[];
@@ -24,6 +35,8 @@ export interface RefreshResult {
 @Injectable()
 export class PricesService {
   private readonly logger = new Logger(PricesService.name);
+  /** Keyed by ticker list and range: the history of a day that has closed never changes. */
+  private readonly historyCache = new Map<string, { at: number; value: PriceHistoryView }>();
 
   constructor(
     private readonly prisma: PrismaService,
@@ -148,6 +161,38 @@ export class PricesService {
     const key = ticker.toUpperCase();
     await this.prisma.priceOverride.deleteMany({ where: { userId, ticker: key } });
     return { ticker: key };
+  }
+
+  /**
+   * Daily closes for every ticker this user has ever traded, from their first trade to today.
+   * The dashboard uses them to value the portfolio on each day it traded, which is what a
+   * time-weighted return needs. Cached for a few hours: history is the same for everyone and
+   * Yahoo is slow and rate limited.
+   */
+  async history(userId: string): Promise<PriceHistoryView> {
+    const rows = await this.prisma.transaction.findMany({
+      where: { userId },
+      select: { ticker: true, tradeDate: true },
+      orderBy: { tradeDate: 'asc' },
+    });
+    if (rows.length === 0) return { start: '', end: '', history: {}, failed: [] };
+
+    const tickers = [...new Set(rows.map((row) => row.ticker))].sort();
+    const start = rows[0].tradeDate.toISOString().slice(0, 10);
+    const end = new Date().toISOString().slice(0, 10);
+    const key = `${tickers.join(',')}|${start}|${end}`;
+    const cached = this.historyCache.get(key);
+    if (cached && Date.now() - cached.at < HISTORY_CACHE_MS) return cached.value;
+
+    try {
+      const result = await this.quotes.history(tickers, start, end);
+      const value = { start, end, history: result.history, failed: result.failed ?? [] };
+      this.historyCache.set(key, { at: Date.now(), value });
+      return value;
+    } catch (error) {
+      this.logger.error(`price history failed for ${userId}: ${String(error)}`);
+      throw new HttpException({ message: 'ดึงราคาย้อนหลังไม่สำเร็จ' }, HttpStatus.BAD_GATEWAY);
+    }
   }
 
   async findYearEnd(): Promise<Record<string, Record<string, string>>> {

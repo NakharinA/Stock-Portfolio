@@ -29,7 +29,10 @@ services:
       PARSER_URL: http://parser:8100
       QUOTES_URL: http://quotes:8200
     ports:
-      - "127.0.0.1:3000:3000"
+      # 3003 on the host because 3000-3002 are already taken on this machine. If the host
+      # port is busy, Docker starts the container with no network at all: the API boots,
+      # but nothing (web, cloudflared) can resolve "api".
+      - "127.0.0.1:3003:3000"
     volumes:
       - ./backend:/app
       - /app/node_modules

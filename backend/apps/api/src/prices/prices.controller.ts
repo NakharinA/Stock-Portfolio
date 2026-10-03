@@ -15,6 +15,12 @@ export class PricesController {
     return this.prices.findAll(userId);
   }
 
+  /** Daily closes for everything this user has traded, for the time-weighted yearly return. */
+  @Get('history')
+  history(@CurrentUser() userId: string) {
+    return this.prices.history(userId);
+  }
+
   /** Fetches fresh market prices for everything this user holds. Rate limited per account. */
   @Post('refresh')
   refresh(@CurrentUser() userId: string) {

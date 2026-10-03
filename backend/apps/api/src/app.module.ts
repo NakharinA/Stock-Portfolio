@@ -9,6 +9,7 @@ import { TransactionsModule } from './transactions/transactions.module';
 import { UsersModule } from './users/users.module';
 import { IngestModule } from './ingest/ingest.module';
 import { SettingsModule } from './settings/settings.module';
+import { StatementsModule } from './statements/statements.module';
 
 @Module({
   imports: [
@@ -22,6 +23,7 @@ import { SettingsModule } from './settings/settings.module';
     LegacyImportModule,
     IngestModule,
     SettingsModule,
+    StatementsModule,
   ],
 })
 export class AppModule {}

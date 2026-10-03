@@ -13,6 +13,12 @@ export interface CloseResult {
   failed: string[];
 }
 
+export interface HistoryResult {
+  /** ticker -> ISO day -> close, trading days only */
+  history: Record<string, Record<string, number>>;
+  failed: string[];
+}
+
 export class QuotesError extends Error {}
 
 /** Client for the quotes service, which is the only thing here that talks to the market. */
@@ -40,6 +46,13 @@ export class QuotesService {
   /** Closing price on or before a day -- 31 December is often not a trading day. */
   async closesOn(tickers: string[], on: string): Promise<CloseResult> {
     return this.get<CloseResult>(`/closes?tickers=${encodeURIComponent(tickers.join(','))}&on=${on}`);
+  }
+
+  /** Daily closes over a range, for valuing a portfolio on the days it traded. */
+  async history(tickers: string[], start: string, end: string): Promise<HistoryResult> {
+    return this.get<HistoryResult>(
+      `/history?tickers=${encodeURIComponent(tickers.join(','))}&start=${start}&end=${end}`,
+    );
   }
 
   async fetch(tickers: string[]): Promise<QuoteResult> {

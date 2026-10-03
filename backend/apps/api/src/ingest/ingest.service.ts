@@ -5,8 +5,15 @@ import { CryptoService } from '../crypto/crypto.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { externalIdFor } from './class/external-id';
 import { ParsedRow } from './interface/parsed-row/parsed-row.interface';
+import { StatementsService } from '../statements/statements.service';
 import { GmailService } from './gmail.service';
 import { ParserError, ParserService } from './parser.service';
+
+/**
+ * The monthly statement mail. Fixed rather than a setting: it is Dime's own subject line, and
+ * the confirmation-note query in settings is about a different kind of mail.
+ */
+export const STATEMENT_QUERY = 'subject:"[Dime!] สรุปข้อมูลการลงทุน" has:attachment filename:pdf';
 
 @Injectable()
 export class IngestService {
@@ -17,6 +24,7 @@ export class IngestService {
     private readonly gmail: GmailService,
     private readonly parser: ParserService,
     private readonly crypto: CryptoService,
+    private readonly statements: StatementsService,
   ) {}
 
   listJobs(userId: string): Promise<ImportJob[]> {
@@ -77,12 +85,19 @@ export class IngestService {
         select: { gmailMessageId: true, filename: true },
       });
       const seenKeys = new Set(seen.map((d) => `${d.gmailMessageId}:${d.filename}`));
+      const statements = await this.importStatements(userId, jobId, password, seenKeys);
       const attachments = await this.gmail.fetchAttachments(userId, query, seenKeys);
 
       if (attachments.length === 0) {
+        const done = statements.saved > 0 ? `เสร็จสิ้น — ไม่มีใบยืนยันใหม่ · รายงานประจำเดือน ${statements.saved} ฉบับ` : 'เสร็จสิ้น — ไม่มีใบยืนยันใหม่';
         await this.prisma.importJob.update({
           where: { id: jobId },
-          data: { state: JobState.DONE, finishedAt: new Date(), log: { push: 'เสร็จสิ้น — ไม่มีใบยืนยันใหม่' } },
+          data: {
+            state: statements.failed > 0 ? JobState.ERROR : JobState.DONE,
+            error: statements.failed > 0 ? `${statements.failed} statement(s) could not be parsed` : null,
+            finishedAt: new Date(),
+            log: { push: done },
+          },
         });
         return;
       }
@@ -137,8 +152,10 @@ export class IngestService {
         await this.recordDocument(userId, attachment, rows.length);
       }
 
+      failed += statements.failed;
       const summary = [
         `เพิ่มใหม่ ${inserted} รายการ`,
+        statements.saved > 0 ? `รายงานประจำเดือน ${statements.saved} ฉบับ` : null,
         skipped > 0 ? `ข้าม ${skipped} ไฟล์ที่ไม่ใช่ใบซื้อขายหุ้น` : null,
         failed > 0 ? `เปิดไม่สำเร็จ ${failed} ไฟล์` : null,
       ]
@@ -161,6 +178,36 @@ export class IngestService {
         data: { state: JobState.ERROR, error: String(error), finishedAt: new Date() },
       });
     }
+  }
+
+  /**
+   * Monthly statements, read before the confirmation notes. Each one is recorded as a source
+   * document like a note is, so it is downloaded only once.
+   */
+  private async importStatements(
+    userId: string,
+    jobId: string,
+    password: string,
+    seenKeys: Set<string>,
+  ): Promise<{ saved: number; failed: number }> {
+    const attachments = await this.gmail.fetchAttachments(userId, STATEMENT_QUERY, seenKeys);
+    let saved = 0;
+    let failed = 0;
+    for (const attachment of attachments) {
+      try {
+        const result = await this.parser.parseStatement(attachment.filename, attachment.content, password);
+        if (result.statement) {
+          await this.statements.save(userId, result.statement, attachment);
+          saved += 1;
+        }
+        await this.recordDocument(userId, attachment, result.statement ? 1 : 0);
+      } catch (error) {
+        failed += 1;
+        const message = error instanceof ParserError ? error.message : String(error);
+        await this.append(jobId, `เปิดรายงานประจำเดือนไม่สำเร็จ: ${attachment.filename} — ${message}`);
+      }
+    }
+    return { saved, failed };
   }
 
   private async recordDocument(

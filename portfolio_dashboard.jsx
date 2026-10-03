@@ -3,6 +3,7 @@ import { Plus, Trash2, TrendingUp, TrendingDown, Wallet, Coins, RefreshCw, Chevr
 import { BarChart, Bar, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine, Cell, LabelList } from "recharts";
 import { api } from "./src/api";
 import { useAuth } from "./src/auth";
+import { portReturns } from "./src/returns";
 
 const FONT_LINK = "https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600;9..144,700&family=Noto+Sans+Thai:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap";
 
@@ -39,6 +40,18 @@ function fmtSigned(n, digits = 2) {
 // counts have to go too: quantity times the visible market price would rebuild the amount.
 const MASK = "•••";
 
+const THAI_MONTHS = ["ม.ค.", "ก.พ.", "มี.ค.", "เม.ย.", "พ.ค.", "มิ.ย.", "ก.ค.", "ส.ค.", "ก.ย.", "ต.ค.", "พ.ย.", "ธ.ค."];
+
+// "2026-02" -> "ก.พ. 69"; a range of months in one bar reads "ก.พ.–มี.ค. 69".
+function monthLabel(from, to) {
+  const [fy, fm] = from.split("-").map(Number);
+  const [ty, tm] = to.split("-").map(Number);
+  const year = (y) => String(y + 543).slice(2);
+  if (from === to) return `${THAI_MONTHS[fm - 1]} ${year(fy)}`;
+  if (fy === ty) return `${THAI_MONTHS[fm - 1]}–${THAI_MONTHS[tm - 1]} ${year(ty)}`;
+  return `${THAI_MONTHS[fm - 1]} ${year(fy)}–${THAI_MONTHS[tm - 1]} ${year(ty)}`;
+}
+
 const EMPTY_TX = { date: "", ticker: "", type: "buy", qty: "", price: "", fee: "0" };
 
 export default function PortfolioDashboard() {
@@ -55,6 +68,11 @@ export default function PortfolioDashboard() {
   const [hideAmounts, setHideAmounts] = useState(false);
   // Years the server already has closing prices for need no input UI.
   const [yearEndFromFile, setYearEndFromFile] = useState({});
+  // Daily closes for the time-weighted yearly return: null while loading, "error" if the
+  // fetch failed, in which case the yearly chart falls back to the cost-based figure.
+  const [priceHistory, setPriceHistory] = useState(null);
+  // Monthly statements from Dime, for the money deposited. Empty until a sync has fetched some.
+  const [statements, setStatements] = useState([]);
   const [backfilling, setBackfilling] = useState(false);
   const [backfillNote, setBackfillNote] = useState("");
 
@@ -74,6 +92,15 @@ export default function PortfolioDashboard() {
       setPriceSource(priceData.fetchedAt ? { label: "ราคาตลาด", fetchedAt: priceData.fetchedAt } : null);
       setYearEndPrices(yearEnd);
       setYearEndFromFile(yearEnd);
+      // Slow (it goes out to Yahoo), so it does not hold up the rest of the dashboard.
+      api
+        .priceHistory()
+        .then(setPriceHistory)
+        .catch(() => setPriceHistory("error"));
+      api
+        .statements()
+        .then(setStatements)
+        .catch(() => setStatements([]));
     } catch (e) {
       setError(e.message || "โหลดข้อมูลไม่สำเร็จ");
     } finally {
@@ -302,140 +329,173 @@ export default function PortfolioDashboard() {
       .sort((a, b) => b.annualizedPct - a.annualizedPct);
   }, [rows, TODAY]);
 
-  // Per-calendar-year return: realized gains + dividends booked in that year, relative to
-  // capital deployed (buys) that same year. Computed purely from transaction records (no need
-  // for historical market prices), so it only reflects realized income, not unrealized/paper gains
-  // on positions still held. The current year is also shown annualized (simple/linear) based on
-  // how much of the year has elapsed, since it's not over yet.
-  // Per-calendar-year TOTAL return: realized gains + dividends booked in that year, PLUS the
-  // change in unrealized P&L over the year (unrealized P&L at year-end minus unrealized P&L at
-  // the start of the year) so appreciation already counted in an earlier year isn't counted again.
-  // Year-end valuations use user-supplied Dec 31 prices (yearEndPrices); the current year uses
-  // today's live prices since it isn't over yet.
-  const yearlyReturns = useMemo(() => {
+  // Per-calendar-year TOTAL return, measured against the capital that was actually at work.
+  //
+  // Numerator, per ticker: realized gains + dividends booked in the year, plus the change in
+  // unrealized P&L over the year (unrealized at the end minus unrealized at the start) so that
+  // appreciation already counted in an earlier year isn't counted again. A ticker whose price is
+  // missing at either end contributes only its realized gains and dividends; it no longer wipes
+  // out the unrealized change of every other ticker.
+  //
+  // Denominator: the average cost basis held, day by day, over the part of the year the
+  // portfolio was active (Modified Dietz on cost). Summing the buys instead would count the same
+  // money again every time it is sold and re-invested, so frequent trading made the return look
+  // several times smaller than it was. A position bought for 100 that sits all year counts as
+  // 100; the same 100 rotated through ten trades still counts as 100, not 1,000.
+  //
+  // Year-end valuations use the Dec 31 prices (yearEndPrices); the current year uses today's
+  // prices since it isn't over yet, and is also shown annualized (simple/linear) over the days
+  // elapsed.
+  //
+  // This is the fallback for when the daily price history cannot be fetched; see `byDeposit` below.
+  const costBasisYearly = useMemo(() => {
     const sorted = [...txs].sort((a, b) => a.date.localeCompare(b.date));
-    const byTicker = {};
-    const yearData = {};
-    const years = [];
-    for (const t of sorted) {
-      const year = t.date.slice(0, 4);
-      if (!yearData[year]) {
-        yearData[year] = { capitalDeployed: 0, realizedGain: 0, dividends: 0 };
-        years.push(year);
-      }
-      if (!byTicker[t.ticker]) byTicker[t.ticker] = { qty: 0, costBasis: 0 };
-      const h = byTicker[t.ticker];
+    if (sorted.length === 0) return [];
+
+    const applyTx = (book, t, onRealized) => {
+      if (!book[t.ticker]) book[t.ticker] = { qty: 0, costBasis: 0 };
+      const h = book[t.ticker];
       if (t.type === "buy") {
-        const cost = t.qty * t.price + t.fee;
         h.qty += t.qty;
-        h.costBasis += cost;
-        yearData[year].capitalDeployed += cost;
+        h.costBasis += t.qty * t.price + t.fee;
       } else if (t.type === "sell") {
         const avgCost = h.qty > 0 ? h.costBasis / h.qty : 0;
+        // Selling more than is held means a buy is missing from the records; only the part
+        // that has a known cost can produce a gain.
         const sellQty = Math.min(t.qty, h.qty);
-        const proceeds = sellQty * t.price - t.fee;
         const costOfSold = sellQty * avgCost;
-        yearData[year].realizedGain += proceeds - costOfSold;
+        if (onRealized) onRealized(t.ticker, sellQty * t.price - t.fee - costOfSold);
         h.costBasis -= costOfSold;
         h.qty -= sellQty;
       } else if (t.type === "dividend") {
-        yearData[year].dividends += t.qty;
+        if (onRealized) onRealized(t.ticker, t.qty);
       }
-    }
-
-    // Replay again, this time snapshotting qty/costBasis at each year-end cutoff so we can value
-    // holdings with that year's closing prices.
-    const holdingsAsOf = (cutoffDate) => {
-      const snap = {};
-      for (const t of sorted) {
-        if (t.date > cutoffDate) break;
-        if (!snap[t.ticker]) snap[t.ticker] = { qty: 0, costBasis: 0 };
-        const h = snap[t.ticker];
-        if (t.type === "buy") {
-          h.qty += t.qty;
-          h.costBasis += t.qty * t.price + t.fee;
-        } else if (t.type === "sell") {
-          const avgCost = h.qty > 0 ? h.costBasis / h.qty : 0;
-          const sellQty = Math.min(t.qty, h.qty);
-          h.costBasis -= sellQty * avgCost;
-          h.qty -= sellQty;
-        }
-      }
-      return snap;
     };
+    const costBasisHeld = (book) => Object.values(book).reduce((s, h) => s + (h.qty > 1e-7 ? h.costBasis : 0), 0);
+    // Unrealized P&L per held ticker, or null where there is no price to value it with.
+    const unrealizedByTicker = (book, priceMap) => {
+      const out = {};
+      for (const [ticker, h] of Object.entries(book)) {
+        if (h.qty <= 1e-7) continue;
+        const p = priceMap[ticker];
+        out[ticker] = p === undefined || p === "" || isNaN(parseFloat(p)) ? null : parseFloat(p) * h.qty - h.costBasis;
+      }
+      return out;
+    };
+    const DAY = 24 * 60 * 60 * 1000;
+    const nextDay = (d) => new Date(new Date(d).getTime() + DAY).toISOString().slice(0, 10);
 
     const nowYear = TODAY.slice(0, 4);
-    const sortedYears = [...years].sort();
-    let prevUnrealized = 0;
-    let prevHadFullCoverage = true;
-    let prevCostBasisTotal = 0;
+    const firstYear = Number(sorted[0].date.slice(0, 4));
+    const book = {};
+    let i = 0;
+    let unrealizedAtStart = {};
+    const result = [];
 
-    return sortedYears.map((year) => {
-      const d = yearData[year];
+    for (let y = firstYear; y <= Number(nowYear); y++) {
+      const year = String(y);
       const isYTD = year === nowYear;
-      const cutoff = isYTD ? TODAY : `${year}-12-31`;
-      const priceMap = isYTD ? prices : yearEndPrices[year] || {};
-      const snap = holdingsAsOf(cutoff);
+      const yearEnd = isYTD ? TODAY : `${year}-12-31`;
+      const heldAtStart = costBasisHeld(book) > 0;
+      // A year that opens with nothing held starts counting from its first trade.
+      const firstTxThisYear = sorted.find((t) => t.date.slice(0, 4) === year);
+      if (!heldAtStart && !firstTxThisYear) continue;
+      const periodStart = heldAtStart ? `${year}-01-01` : firstTxThisYear.date;
 
-      let unrealizedAtYearEnd = 0;
-      let costBasisTotal = 0;
-      let fullCoverage = true;
-      const missingTickers = [];
-      for (const [ticker, h] of Object.entries(snap)) {
-        if (h.qty <= 1e-7) continue;
-        costBasisTotal += h.costBasis;
-        const p = priceMap[ticker];
-        if (p === undefined || p === "" || isNaN(parseFloat(p))) {
-          fullCoverage = false;
-          missingTickers.push(ticker);
-          continue;
+      const realizedByTicker = {};
+      const onRealized = (ticker, amount) => (realizedByTicker[ticker] = (realizedByTicker[ticker] || 0) + amount);
+      let capitalDeployed = 0;
+      let capitalDays = 0;
+      let days = 0;
+      for (let d = periodStart; d <= yearEnd; d = nextDay(d)) {
+        while (i < sorted.length && sorted[i].date <= d) {
+          const t = sorted[i++];
+          if (t.type === "buy") capitalDeployed += t.qty * t.price + t.fee;
+          applyTx(book, t, onRealized);
         }
-        unrealizedAtYearEnd += parseFloat(p) * h.qty - h.costBasis;
+        capitalDays += costBasisHeld(book);
+        days += 1;
+      }
+      const averageCapital = days > 0 ? capitalDays / days : 0;
+
+      const priceMap = isYTD ? prices : yearEndPrices[year] || {};
+      const unrealizedAtEnd = unrealizedByTicker(book, priceMap);
+      const missingTickers = Object.keys(unrealizedAtEnd).filter((t) => unrealizedAtEnd[t] === null);
+      // Held coming into the year but never valued at the previous year-end: its start point is
+      // unknown, so its unrealized change cannot be separated from earlier years.
+      const missingStartTickers = Object.keys(unrealizedAtStart).filter((t) => unrealizedAtStart[t] === null);
+
+      let realizedGain = 0;
+      for (const v of Object.values(realizedByTicker)) realizedGain += v;
+      let unrealizedGainInYear = 0;
+      for (const ticker of new Set([...Object.keys(unrealizedAtStart), ...Object.keys(unrealizedAtEnd)])) {
+        const start = ticker in unrealizedAtStart ? unrealizedAtStart[ticker] : 0;
+        const end = ticker in unrealizedAtEnd ? unrealizedAtEnd[ticker] : 0;
+        if (start === null || end === null) continue;
+        unrealizedGainInYear += end - start;
       }
 
-      const unrealizedGainInYear = fullCoverage && prevHadFullCoverage ? unrealizedAtYearEnd - prevUnrealized : null;
-      const totalGain = d.realizedGain + d.dividends + (unrealizedGainInYear || 0);
-      // Denominator = capital that was "in the market" at some point during the year: what was
-      // already invested coming into the year, plus whatever new capital was deployed this year.
-      // This intentionally does NOT shrink when a position is sold, so — matching how a simple
-      // "return on my original cost" should work — a holding bought for 100 that's worth 150 at
-      // year-end and 200 today shows 50% for each of those two years, not a shrinking base.
-      const denominator = prevCostBasisTotal + d.capitalDeployed;
-      const simplePct = denominator > 0 ? (totalGain / denominator) * 100 : null;
+      const totalGain = realizedGain + unrealizedGainInYear;
+      const simplePct = averageCapital > 0 ? (totalGain / averageCapital) * 100 : null;
       let annualizedPct = simplePct;
-      if (isYTD && simplePct !== null) {
-        const daysElapsed = Math.max(1, (new Date(TODAY) - new Date(`${year}-01-01`)) / (1000 * 60 * 60 * 24));
-        annualizedPct = simplePct * (365 / daysElapsed);
-      }
+      if (isYTD && simplePct !== null) annualizedPct = simplePct * (365 / Math.max(1, days));
 
-      prevUnrealized = fullCoverage ? unrealizedAtYearEnd : prevUnrealized;
-      prevHadFullCoverage = fullCoverage;
-      prevCostBasisTotal = costBasisTotal;
-
-      return {
+      result.push({
         year,
         simplePct,
         annualizedPct,
         isYTD,
+        periodStart,
+        days,
+        averageCapital,
+        capitalDeployed,
+        realizedGain,
         unrealizedGainInYear,
         missingTickers,
-        // Any year missing a price is understated, not just a past one: the unrealized part
-        // drops out of the numerator while the denominator still counts every baht put in.
-        // The current year used to be exempt from this flag, which hid exactly that.
-        missingPrices: missingTickers.length > 0,
+        missingStartTickers,
+        // Any year missing a price is understated: that ticker's unrealized part drops out of
+        // the numerator while its capital is still in the denominator.
+        missingPrices: missingTickers.length > 0 || missingStartTickers.length > 0,
         needsYearEndPrices: !isYTD && missingTickers.length > 0,
-        ...d,
-      };
-    });
+      });
+
+      unrealizedAtStart = unrealizedAtEnd;
+    }
+    return result;
   }, [txs, prices, yearEndPrices, TODAY]);
 
-  // Which tickers were held at the end of each PAST (non-current) year, for the year-end price inputs.
+  // Yearly profit from the money deposited and the port's value at each year end (see
+  // src/returns.js), deposits taken from the monthly statements' cash. Needs daily closes to
+  // value the port wherever no statement does.
+  const byDeposit = useMemo(
+    () => (priceHistory && priceHistory !== "error" ? portReturns(txs, statements, priceHistory.history, prices, TODAY) : null),
+    [txs, statements, priceHistory, prices, TODAY],
+  );
+  // Cash in the Dime account: the last statement's cash balance, moved on by the trades since.
+  const wallet = byDeposit ? byDeposit.cashNow : null;
+
+  const yearlyReturns = useMemo(
+    () =>
+      byDeposit
+        ? byDeposit.years.map((y) => ({
+            ...y,
+            annualizedPct: y.simplePct,
+            missingTickers: [],
+            missingStartTickers: [],
+            missingPrices: false,
+            needsYearEndPrices: false,
+          }))
+        : costBasisYearly,
+    [byDeposit, costBasisYearly],
+  );
+
+  // Which tickers were held at the end of each PAST (non-current) year and have no closing price
+  // on the server yet, for the year-end price inputs. Checked per ticker: a year where the server
+  // knows some closing prices but not all still needs inputs for the rest.
   const yearEndHoldingsNeeded = useMemo(() => {
     const sorted = [...txs].sort((a, b) => a.date.localeCompare(b.date));
     const nowYear = TODAY.slice(0, 4);
-    const years = [...new Set(sorted.map((t) => t.date.slice(0, 4)))]
-      .filter((y) => y !== nowYear && !yearEndFromFile[y])
-      .sort();
+    const years = [...new Set(sorted.map((t) => t.date.slice(0, 4)))].filter((y) => y !== nowYear).sort();
     const result = {};
     for (const year of years) {
       const cutoff = `${year}-12-31`;
@@ -454,7 +514,7 @@ export default function PortfolioDashboard() {
           h.qty -= sellQty;
         }
       }
-      const tickers = Object.keys(snap).filter((t) => snap[t].qty > 1e-7);
+      const tickers = Object.keys(snap).filter((t) => snap[t].qty > 1e-7 && yearEndFromFile[year]?.[t] === undefined);
       if (tickers.length > 0) result[year] = tickers;
     }
     return result;
@@ -533,6 +593,18 @@ export default function PortfolioDashboard() {
       .sort((a, b) => a[0].localeCompare(b[0]))
       .map(([month, p]) => ({ month, ...p }));
   }, [txs]);
+
+  // Growth chart points with the cash in the port that month (carried forward through months
+  // with no trade), so the solid line is all the money in the port, not only what is in stocks.
+  const growthWithWallet = useMemo(() => {
+    if (!byDeposit) return growthSeries;
+    let last = 0;
+    return growthSeries.map((p) => {
+      if (p.month in byDeposit.cashByMonth) last = byDeposit.cashByMonth[p.month];
+      const walletCash = Math.round(last * 100) / 100;
+      return { ...p, wallet: walletCash, costBasisAndWallet: Math.round((p.costBasis + walletCash) * 100) / 100 };
+    });
+  }, [growthSeries, byDeposit]);
 
   return (
     <div
@@ -680,9 +752,27 @@ export default function PortfolioDashboard() {
           <SummaryCard icon={<Wallet size={15} />} label="ต้นทุนคงเหลือ" value={money(totals.costBasis, 0)} />
           <SummaryCard
             icon={<Coins size={15} />}
-            label="มูลค่าปัจจุบัน"
-            value={totals.hasAllPrices || totals.currentValue > 0 ? money(totals.currentValue, 0) : "รอราคา"}
-            sub={!totals.hasAllPrices ? "บางตัวยังไม่ใส่ราคา" : undefined}
+            label="มูลค่าปัจจุบัน (หุ้น + เงินสด)"
+            value={totals.hasAllPrices || totals.currentValue > 0 ? money(totals.currentValue + (wallet ?? 0), 0) : "รอราคา"}
+            sub={
+              !totals.hasAllPrices
+                ? "บางตัวยังไม่ใส่ราคา"
+                : wallet === null
+                  ? "กำลังคำนวณเงินสด..."
+                  : `หุ้น ${money(totals.currentValue, 0)} · เงินสด ${money(wallet, 0)}`
+            }
+          />
+          <SummaryCard
+            icon={<Wallet size={15} />}
+            label="เงินสดในพอร์ต (wallet)"
+            value={wallet === null ? "-" : money(wallet, 0)}
+            sub={
+              byDeposit?.lastStatement
+                ? `จากรายงาน ณ ${byDeposit.lastStatement} + รายการหลังจากนั้น`
+                : byDeposit
+                  ? "ประมาณจากรายการซื้อขาย (ยังไม่มีรายงานประจำเดือน)"
+                  : undefined
+            }
           />
           <SummaryCard
             icon={totals.unrealizedPL >= 0 ? <TrendingUp size={15} /> : <TrendingDown size={15} />}
@@ -766,21 +856,39 @@ export default function PortfolioDashboard() {
               การเติบโตของพอร์ต
             </div>
             <div style={{ fontSize: 11, color: COLORS.muted, marginBottom: 10 }}>
-              เส้นทึบ = ต้นทุนที่ลงทุนอยู่สะสม (cost basis) · เส้นประ = กำไรสะสม (realized + ปันผล) — ยังไม่รวมมูลค่าตลาดปัจจุบันที่ผันผวนรายวัน
+              {byDeposit
+                ? "เส้นทึบ = เงินในพอร์ตทั้งหมด (ต้นทุนหุ้นที่ถืออยู่ + เงินสดใน wallet) · เส้นบาง = เงินสดใน wallet · เส้นประ = กำไรสะสม (realized + ปันผล) — ยังไม่รวมมูลค่าตลาดปัจจุบันที่ผันผวนรายวัน"
+                : "เส้นทึบ = ต้นทุนที่ลงทุนอยู่สะสม (cost basis) · เส้นประ = กำไรสะสม (realized + ปันผล) — ยังไม่รวมมูลค่าตลาดปัจจุบันที่ผันผวนรายวัน"}
             </div>
             <div style={{ background: COLORS.panel, border: `1px solid ${COLORS.panelLine}`, borderRadius: 10, padding: "14px 8px 6px" }}>
               <ResponsiveContainer width="100%" height={220}>
-                <LineChart data={growthSeries} margin={{ top: 5, right: 16, left: 0, bottom: 0 }}>
+                <LineChart data={growthWithWallet} margin={{ top: 5, right: 16, left: 0, bottom: 0 }}>
                   <CartesianGrid strokeDasharray="3 3" stroke={COLORS.panelLine} vertical={false} />
                   <XAxis dataKey="month" tick={{ fill: COLORS.muted, fontSize: 10.5 }} axisLine={{ stroke: COLORS.panelLine }} tickLine={false} />
                   <YAxis tick={{ fill: COLORS.muted, fontSize: 10.5 }} axisLine={false} tickLine={false} width={54} tickFormatter={(v) => (hideAmounts ? "" : fmt(v, 0) + "$")} />
                   <Tooltip
                     contentStyle={{ background: COLORS.ink2, border: `1px solid ${COLORS.panelLine}`, borderRadius: 6, fontSize: 12 }}
                     labelStyle={{ color: COLORS.paper }}
-                    formatter={(v, name) => [money(v, 0), name === "costBasis" ? "ต้นทุนคงเหลือสะสม" : "กำไรสะสม (realized+ปันผล)"]}
+                    formatter={(v, name) => [
+                      money(v, 0),
+                      {
+                        costBasis: "ต้นทุนคงเหลือสะสม",
+                        costBasisAndWallet: "ต้นทุนหุ้น + เงินสด",
+                        wallet: "เงินสดใน wallet",
+                        realizedAndDividends: "กำไรสะสม (realized+ปันผล)",
+                      }[name],
+                    ]}
                   />
                   <ReferenceLine y={0} stroke={COLORS.panelLine} />
-                  <Line type="monotone" dataKey="costBasis" stroke={COLORS.gold} strokeWidth={2} dot={false} name="costBasis" />
+                  <Line
+                    type="monotone"
+                    dataKey={byDeposit ? "costBasisAndWallet" : "costBasis"}
+                    stroke={COLORS.gold}
+                    strokeWidth={2}
+                    dot={false}
+                    name={byDeposit ? "costBasisAndWallet" : "costBasis"}
+                  />
+                  {byDeposit && <Line type="monotone" dataKey="wallet" stroke={COLORS.paper} strokeOpacity={0.6} strokeWidth={1.2} dot={false} name="wallet" />}
                   <Line type="monotone" dataKey="realizedAndDividends" stroke={COLORS.gain} strokeWidth={2} strokeDasharray="4 3" dot={false} name="realizedAndDividends" />
                 </LineChart>
               </ResponsiveContainer>
@@ -794,7 +902,11 @@ export default function PortfolioDashboard() {
               ผลตอบแทนรายปี — ปีนี้คุณได้เท่าไหร่
             </div>
             <div style={{ fontSize: 11, color: COLORS.muted, marginBottom: 10 }}>
-              กำไรที่ขายจริง + ปันผล + การเปลี่ยนแปลงของกำไร/ขาดทุนที่ยังไม่ขาย (เทียบราคาปิดสิ้นปีก่อนหน้ากับสิ้นปีนี้ ไม่นับซ้ำข้ามปี) เทียบกับเงินลงทุนที่ใส่เข้าไปในปีนั้น — ปีปัจจุบันแปลงเป็นอัตราเทียบเท่ารายปีตามสัดส่วนวันที่ผ่านมาแล้ว
+              {byDeposit
+                ? "กำไรของปี = มูลค่าพอร์ตสิ้นปี − มูลค่าพอร์ตต้นปี − เงินที่เติมเข้าในปีนั้น · ผลตอบแทน = กำไร ÷ (มูลค่าต้นปี + เงินเติม) · มูลค่าพอร์ต = มูลค่าหุ้น + เงินสดในพอร์ต · เงินเติมคิดจากเงินสดในรายงานประจำเดือนของ Dime เทียบกับรายการซื้อขาย"
+                : "กำไรที่ขายจริง + ปันผล + การเปลี่ยนแปลงของกำไร/ขาดทุนที่ยังไม่ขาย (เทียบราคาปิดสิ้นปีก่อนหน้ากับสิ้นปีนี้ ไม่นับซ้ำข้ามปี) เทียบกับต้นทุนที่ถืออยู่จริงเฉลี่ยรายวันในปีนั้น (เงินที่ขายแล้วซื้อใหม่ไม่ถูกนับซ้ำ) — ปีปัจจุบันแปลงเป็นอัตราเทียบเท่ารายปีตามสัดส่วนวันที่ผ่านมาแล้ว"}
+              {priceHistory === null && " · กำลังโหลดราคาย้อนหลัง..."}
+              {priceHistory === "error" && " · โหลดราคาย้อนหลังไม่สำเร็จ จึงใช้วิธีคำนวณจากต้นทุนแทน"}
             </div>
             {yearlyReturns.some((r) => r.isYTD && r.missingPrices) && (
               <div
@@ -808,8 +920,14 @@ export default function PortfolioDashboard() {
                   marginBottom: 10,
                 }}
               >
-                ผลตอบแทนปีนี้ต่ำกว่าความเป็นจริง — ยังไม่รวมกำไร/ขาดทุนที่ยังไม่ขาย เพราะขาดราคาปัจจุบันของ{" "}
-                {yearlyReturns.find((r) => r.isYTD).missingTickers.join(", ")} · กดปุ่ม “ดึงราคาล่าสุด” ด้านบน
+                ผลตอบแทนปีนี้ยังไม่ครบ — ไม่รวมกำไร/ขาดทุนที่ยังไม่ขายของ{" "}
+                {(() => {
+                  const ytd = yearlyReturns.find((r) => r.isYTD);
+                  const parts = [];
+                  if (ytd.missingTickers.length > 0) parts.push(`${ytd.missingTickers.join(", ")} (ขาดราคาปัจจุบัน · กดปุ่ม “ดึงราคาล่าสุด” ด้านบน)`);
+                  if (ytd.missingStartTickers.length > 0) parts.push(`${ytd.missingStartTickers.join(", ")} (ขาดราคาปิดสิ้นปีก่อน)`);
+                  return parts.join(" · ");
+                })()}
               </div>
             )}
             <div style={{ background: COLORS.panel, border: `1px solid ${COLORS.panelLine}`, borderRadius: 10, padding: "14px 8px 6px" }}>
@@ -831,11 +949,15 @@ export default function PortfolioDashboard() {
                     labelStyle={{ color: COLORS.paper }}
                     formatter={(v, name, props) => {
                       const p = props.payload;
+                      if (byDeposit)
+                        return [`${fmtSigned(p.simplePct, 1)}% · กำไร ${moneySigned(p.profit, 0)}`, p.isYTD ? "ผลตอบแทน (ถึงวันนี้)" : "ผลตอบแทน"];
                       const lines = [fmtSigned(p.annualizedPct, 1) + "%" + (p.isYTD ? " (เทียบเท่ารายปี)" : "")];
                       if (p.isYTD) lines.push(`ตามจริง ณ วันนี้: ${fmtSigned(p.simplePct, 1)}%`);
-                      if (p.needsYearEndPrices) lines.push(`ยังไม่รวม unrealized — ขาดราคาปิด: ${p.missingTickers.join(", ")}`);
-                      else if (p.missingPrices)
-                        lines.push(`ตัวเลขต่ำกว่าจริง — ยังไม่รวม unrealized เพราะขาดราคาปัจจุบันของ ${p.missingTickers.join(", ")} (กดดึงราคาล่าสุด)`);
+                      if (p.needsYearEndPrices) lines.push(`ยังไม่รวม unrealized ของ ${p.missingTickers.join(", ")} — ขาดราคาปิด 31 ธ.ค.`);
+                      else if (p.missingTickers.length > 0)
+                        lines.push(`ยังไม่รวม unrealized ของ ${p.missingTickers.join(", ")} — ขาดราคาปัจจุบัน (กดดึงราคาล่าสุด)`);
+                      if (p.missingStartTickers.length > 0)
+                        lines.push(`ยังไม่รวม unrealized ของ ${p.missingStartTickers.join(", ")} — ขาดราคาปิดสิ้นปีก่อน`);
                       return [lines.join(" · "), "ผลตอบแทน"];
                     }}
                   />
@@ -858,7 +980,72 @@ export default function PortfolioDashboard() {
                 </BarChart>
               </ResponsiveContainer>
 
-              {Object.keys(yearEndHoldingsNeeded).length > 0 && (
+              {byDeposit && byDeposit.mismatches.length > 0 && (
+                <div style={{ background: "#2A1A1A", border: `1px solid ${COLORS.loss}`, color: COLORS.loss, padding: "8px 12px", borderRadius: 6, fontSize: 12, margin: "6px 8px" }}>
+                  จำนวนหุ้นในรายงานประจำเดือนไม่ตรงกับรายการซื้อขายที่บันทึกไว้ — อาจมีใบยืนยันที่ไม่ได้นำเข้า ทำให้เงินเติมและกำไรคลาดเคลื่อน ·{" "}
+                  {(() => {
+                    // The first statement each ticker went wrong on says roughly when the trade is missing.
+                    const firstSeen = {};
+                    for (const m of byDeposit.mismatches) for (const d of m.diffs) if (!(d.ticker in firstSeen)) firstSeen[d.ticker] = { asOf: m.asOf, ...d };
+                    return Object.values(firstSeen)
+                      .map((d) => `${d.ticker} ตั้งแต่รายงาน ${d.asOf} (รายงาน ${shares(d.onStatement)} หุ้น · บันทึกไว้ ${shares(d.onRecord)} หุ้น)`)
+                      .join(" · ");
+                  })()}
+                </div>
+              )}
+
+              {byDeposit && (
+                <div style={{ borderTop: `1px solid ${COLORS.panelLine}`, marginTop: 6, padding: "8px 8px 4px", overflowX: "auto" }}>
+                  <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12, minWidth: 620 }}>
+                    <thead>
+                      <tr style={{ color: COLORS.muted, textAlign: "right" }}>
+                        <th style={{ textAlign: "left", fontWeight: 500, padding: "4px 6px" }}>ช่วง</th>
+                        <th style={{ fontWeight: 500, padding: "4px 6px" }}>มูลค่าต้นงวด</th>
+                        <th style={{ fontWeight: 500, padding: "4px 6px" }}>เงินเติม</th>
+                        <th style={{ fontWeight: 500, padding: "4px 6px" }}>มูลค่าปลายงวด</th>
+                        <th style={{ fontWeight: 500, padding: "4px 6px" }}>กำไร</th>
+                        <th style={{ fontWeight: 500, padding: "4px 6px" }}>ผลตอบแทน</th>
+                      </tr>
+                    </thead>
+                    <tbody className="pf-mono">
+                      {byDeposit.years.map((y) => (
+                        <tr key={y.year} style={{ textAlign: "right", borderTop: `1px solid ${COLORS.panelLine}` }}>
+                          <td style={{ textAlign: "left", padding: "5px 6px", color: COLORS.paper }}>
+                            {y.year}
+                            <div style={{ fontSize: 10.5, color: COLORS.muted }}>
+                              {y.periodStart} → {y.periodEnd}
+                            </div>
+                          </td>
+                          <td style={{ padding: "5px 6px" }}>{money(y.startValue, 0)}</td>
+                          <td style={{ padding: "5px 6px" }}>{money(y.deposited, 0)}</td>
+                          <td style={{ padding: "5px 6px" }}>{money(y.endValue, 0)}</td>
+                          <td style={{ padding: "5px 6px", color: y.profit >= 0 ? COLORS.gain : COLORS.loss }}>{moneySigned(y.profit, 0)}</td>
+                          <td style={{ padding: "5px 6px" }}>{y.simplePct === null ? "-" : fmtSigned(y.simplePct, 1) + "%"}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                  <div style={{ fontSize: 12, color: COLORS.muted, marginTop: 8 }}>
+                    เงินเติมรวม {money(byDeposit.totalDeposited, 0)} · มูลค่าพอร์ตตอนนี้ {money(byDeposit.valueNow, 0)} (เงินสด {money(byDeposit.cashNow, 0)}) · กำไรรวม{" "}
+                    {moneySigned(byDeposit.totalProfit, 0)} ·{" "}
+                    <b style={{ color: byDeposit.totalPct >= 0 ? COLORS.gain : COLORS.loss }}>รวม {fmtSigned(byDeposit.totalPct, 1)}%</b>
+                    {byDeposit.xirrPct !== null && (
+                      <>
+                        {" "}· ต่อปี (XIRR){" "}
+                        <b style={{ color: byDeposit.xirrPct >= 0 ? COLORS.gain : COLORS.loss }}>{fmtSigned(byDeposit.xirrPct, 1)}%</b>
+                      </>
+                    )}
+                  </div>
+                  <div style={{ fontSize: 11, color: COLORS.muted, marginTop: 4 }}>
+                    {byDeposit.statementCount > 0
+                      ? `เงินเติมจากรายงานประจำเดือน ${byDeposit.statementCount} ฉบับ (ล่าสุด ณ ${byDeposit.lastStatement}) · หลังจากนั้นประมาณจากรายการซื้อที่เงินสดในพอร์ตไม่พอจ่าย จนกว่ารายงานฉบับถัดไปจะมา`
+                      : "ยังไม่มีรายงานประจำเดือน — เงินเติมเป็นค่าประมาณจากรายการซื้อที่เงินสดในพอร์ตไม่พอจ่าย และมองไม่เห็นการถอนเงิน · กดซิงก์อีเมลเพื่อดึงรายงานประจำเดือนของ Dime"}
+                    {byDeposit.approxTickers.length > 0 && <> · ไม่มีราคาย้อนหลังของ {byDeposit.approxTickers.join(", ")} จึงใช้ราคาซื้อขายล่าสุดแทน</>}
+                  </div>
+                </div>
+              )}
+
+              {!byDeposit && Object.keys(yearEndHoldingsNeeded).length > 0 && (
                 <div style={{ marginTop: 10, paddingTop: 10, borderTop: `1px solid ${COLORS.panelLine}` }}>
                   <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8, flexWrap: "wrap" }}>
                     <div style={{ fontSize: 11, color: COLORS.muted, flex: 1, minWidth: 240 }}>
@@ -905,6 +1092,67 @@ export default function PortfolioDashboard() {
                   ))}
                 </div>
               )}
+            </div>
+          </div>
+        )}
+
+        {byDeposit && byDeposit.monthlyDeposits.length > 0 && (
+          <div style={{ marginBottom: 26 }}>
+            <div className="pf-display" style={{ fontSize: 15, fontWeight: 600, marginBottom: 2 }}>
+              เงินที่เติมเข้าพอร์ตรายเดือน
+            </div>
+            <div style={{ fontSize: 11, color: COLORS.muted, marginBottom: 10 }}>
+              เงินที่โอนเข้าพอร์ตจริง ไม่นับเงินจากการขายหุ้นหรือปันผลที่นำไปซื้อต่อ · คิดจากเงินสดในรายงานประจำเดือนของ Dime เทียบกับรายการซื้อขาย · ค่าติดลบ = ถอนเงินออก ·
+              แท่งจาง = ค่าประมาณ (ยังไม่มีรายงานประจำเดือน) · เดือนที่ Dime ไม่ได้ส่งรายงาน ยอดของช่วงนั้นจะแบ่งเท่า ๆ กันให้แต่ละเดือน (แท่งลาย)
+            </div>
+            <div style={{ background: COLORS.panel, border: `1px solid ${COLORS.panelLine}`, borderRadius: 10, padding: "14px 8px 6px" }}>
+              <ResponsiveContainer width="100%" height={220}>
+                <BarChart
+                  data={byDeposit.monthlyDeposits.map((m) => ({ ...m, label: monthLabel(m.month, m.month) }))}
+                  margin={{ top: 5, right: 16, left: 0, bottom: 0 }}
+                >
+                  <defs>
+                    {/* Striped fill for months that share one statement's amount evenly. */}
+                    <pattern id="pf-split" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+                      <rect width="6" height="6" fill={COLORS.gold} fillOpacity="0.55" />
+                      <line x1="0" y1="0" x2="0" y2="6" stroke={COLORS.gold} strokeWidth="3" />
+                    </pattern>
+                  </defs>
+                  <CartesianGrid strokeDasharray="3 3" stroke={COLORS.panelLine} vertical={false} />
+                  <XAxis dataKey="label" tick={{ fill: COLORS.muted, fontSize: 10.5 }} axisLine={{ stroke: COLORS.panelLine }} tickLine={false} interval="preserveStartEnd" />
+                  <YAxis tick={{ fill: COLORS.muted, fontSize: 10.5 }} axisLine={false} tickLine={false} width={54} tickFormatter={(v) => (hideAmounts ? "" : fmt(v, 0) + "$")} />
+                  <Tooltip
+                    cursor={{ fill: COLORS.panelLine, opacity: 0.4 }}
+                    contentStyle={{ background: COLORS.ink2, border: `1px solid ${COLORS.panelLine}`, borderRadius: 6, fontSize: 12 }}
+                    labelStyle={{ color: COLORS.paper }}
+                    formatter={(v, name, props) => {
+                      const p = props.payload;
+                      const note = p.estimated ? " (ประมาณ)" : p.splitFrom ? ` (แบ่งเฉลี่ยจากยอดรวม ${monthLabel(p.splitFrom, p.splitTo)})` : "";
+                      return [moneySigned(v, 2) + note, v < 0 ? "ถอนออก" : "เติมเข้า"];
+                    }}
+                  />
+                  <ReferenceLine y={0} stroke={COLORS.panelLine} />
+                  <Bar dataKey="amount" radius={[3, 3, 0, 0]}>
+                    {byDeposit.monthlyDeposits.map((m, i) => (
+                      <Cell
+                        key={i}
+                        fill={m.splitFrom ? "url(#pf-split)" : m.amount < 0 ? COLORS.loss : COLORS.gold}
+                        fillOpacity={m.estimated ? 0.4 : 1}
+                      />
+                    ))}
+                  </Bar>
+                </BarChart>
+              </ResponsiveContainer>
+              <div style={{ fontSize: 12, color: COLORS.muted, padding: "8px 8px 4px", borderTop: `1px solid ${COLORS.panelLine}`, marginTop: 6 }}>
+                {byDeposit.years.map((y, i) => (
+                  <span key={y.year}>
+                    {i > 0 && " · "}
+                    เติมปี {y.year}
+                    {y.isYTD ? " (ถึงวันนี้)" : ""}: <b style={{ color: COLORS.paper }}>{moneySigned(y.deposited, 0)}</b>
+                  </span>
+                ))}
+                {" "}· รวมทั้งหมด <b style={{ color: COLORS.paper }}>{money(byDeposit.totalDeposited, 0)}</b>
+              </div>
             </div>
           </div>
         )}

@@ -27,6 +27,7 @@ model User {
   priceOverrides  PriceOverride[]
   importJobs      ImportJob[]
   sourceDocuments SourceDocument[]
+  statements      MonthlyStatement[]
 
   @@map("users")
 }
@@ -181,4 +182,28 @@ model SourceDocument {
 
   @@unique([userId, gmailMessageId, filename])
   @@map("source_documents")
+}
+
+/// The offshore part of a Dime monthly statement, one row per month. Cash from one month to
+/// the next, with the month's trades, gives the money deposited; total + cash is the port's
+/// value at the end of the month.
+model MonthlyStatement {
+  id                  String   @id @default(uuid())
+  userId              String
+  asOf                DateTime @db.Date
+  /// Stocks at market value, USD.
+  totalBalance        Decimal  @db.Decimal(20, 4)
+  cashBalance         Decimal  @db.Decimal(20, 4)
+  dividendsSinceStart Decimal  @default(0) @db.Decimal(20, 4)
+  /// ticker -> shares held at asOf, to check the trades on record against.
+  holdings            Json     @default("{}")
+  gmailMessageId      String
+  filename            String
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, asOf])
+  @@map("monthly_statements")
 }

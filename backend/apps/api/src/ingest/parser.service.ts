@@ -1,5 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { StatementParseResult } from '../statements/interface/parsed-statement/parsed-statement.interface';
 import { ParseResult } from './interface/parsed-row/parsed-row.interface';
 
 export class ParserError extends Error {}
@@ -14,12 +15,21 @@ export class ParserService {
   constructor(private readonly config: ConfigService) {}
 
   async parse(filename: string, pdf: Buffer, password: string): Promise<ParseResult> {
+    return this.post<ParseResult>('/parse', filename, pdf, password);
+  }
+
+  /** The offshore balances of a monthly statement. */
+  async parseStatement(filename: string, pdf: Buffer, password: string): Promise<StatementParseResult> {
+    return this.post<StatementParseResult>('/statement', filename, pdf, password);
+  }
+
+  private async post<T>(path: string, filename: string, pdf: Buffer, password: string): Promise<T> {
     const form = new FormData();
     form.append('file', new Blob([new Uint8Array(pdf)], { type: 'application/pdf' }), filename);
     form.append('password', password);
 
     const base = this.config.get<string>('PARSER_URL') ?? 'http://parser:8100';
-    const res = await fetch(`${base}/parse`, { method: 'POST', body: form });
+    const res = await fetch(`${base}${path}`, { method: 'POST', body: form });
 
     if (!res.ok) {
       // 422 is the parser saying the document is wrong -- bad password, a scan with no text
@@ -31,6 +41,6 @@ export class ParserService {
       throw new ParserError(detail);
     }
 
-    return (await res.json()) as ParseResult;
+    return (await res.json()) as T;
   }
 }
