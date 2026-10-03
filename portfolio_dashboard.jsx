@@ -559,6 +559,7 @@ export default function PortfolioDashboard() {
     const byTickerRunning = {};
     let cumCostBasis = 0;
     let cumRealizedAndDividends = 0;
+    let cumDividends = 0;
     const points = [];
     for (const t of sorted) {
       if (!byTickerRunning[t.ticker]) byTickerRunning[t.ticker] = { qty: 0, costBasis: 0 };
@@ -578,11 +579,13 @@ export default function PortfolioDashboard() {
         h.qty -= sellQty;
       } else if (t.type === "dividend") {
         cumRealizedAndDividends += t.qty;
+        cumDividends += t.qty;
       }
       points.push({
         date: t.date,
         costBasis: Math.round(cumCostBasis * 100) / 100,
         realizedAndDividends: Math.round(cumRealizedAndDividends * 100) / 100,
+        dividends: cumDividends,
         total: Math.round((cumCostBasis + cumRealizedAndDividends) * 100) / 100,
       });
     }
@@ -596,15 +599,29 @@ export default function PortfolioDashboard() {
 
   // Growth chart points with the cash in the port that month (carried forward through months
   // with no trade), so the solid line is all the money in the port, not only what is in stocks.
+  // Dividends come from the statements too: confirmation notes never carry them, so without
+  // this the profit line leaves out every dividend ever paid.
   const growthWithWallet = useMemo(() => {
-    if (!byDeposit) return growthSeries;
-    let last = 0;
+    const sortedStatements = [...statements].sort((a, b) => a.asOf.localeCompare(b.asOf));
+    let lastCash = 0;
     return growthSeries.map((p) => {
-      if (p.month in byDeposit.cashByMonth) last = byDeposit.cashByMonth[p.month];
-      const walletCash = Math.round(last * 100) / 100;
-      return { ...p, wallet: walletCash, costBasisAndWallet: Math.round((p.costBasis + walletCash) * 100) / 100 };
+      const known = sortedStatements.filter((st) => st.asOf.slice(0, 7) <= p.month);
+      const statementDividends = known.length ? Number(known[known.length - 1].dividendsSinceStart) : 0;
+      const missingDividends = Math.max(0, statementDividends - p.dividends);
+      const point = { ...p, realizedAndDividends: Math.round((p.realizedAndDividends + missingDividends) * 100) / 100 };
+      if (!byDeposit) return point;
+      if (p.month in byDeposit.cashByMonth) lastCash = byDeposit.cashByMonth[p.month];
+      const walletCash = Math.round(lastCash * 100) / 100;
+      return { ...point, wallet: walletCash, costBasisAndWallet: Math.round((p.costBasis + walletCash) * 100) / 100 };
     });
-  }, [growthSeries, byDeposit]);
+  }, [growthSeries, byDeposit, statements]);
+
+  // Dividends paid since the account opened: the larger of what is on record and what the last
+  // statement says, since dividend rows only exist when someone typed them in.
+  const dividendsReceived = useMemo(() => {
+    const last = [...statements].sort((a, b) => a.asOf.localeCompare(b.asOf)).pop();
+    return Math.max(totals.dividends, last ? Number(last.dividendsSinceStart) : 0);
+  }, [statements, totals.dividends]);
 
   return (
     <div
@@ -785,11 +802,16 @@ export default function PortfolioDashboard() {
             value={moneySigned(totals.realizedPL, 0)}
             color={totals.realizedPL >= 0 ? COLORS.gain : COLORS.loss}
           />
-          <SummaryCard label="ปันผลรวม" value={money(totals.dividends, 0)} color={COLORS.gold} />
+          <SummaryCard
+            label="ปันผลรวม"
+            value={money(dividendsReceived, 0)}
+            color={COLORS.gold}
+            sub={dividendsReceived > totals.dividends ? "จากรายงานประจำเดือนของ Dime" : undefined}
+          />
           <SummaryCard
             label="ผลตอบแทนรวมทั้งหมด"
-            value={moneySigned(totals.totalReturn, 0)}
-            color={totals.totalReturn >= 0 ? COLORS.gain : COLORS.loss}
+            value={moneySigned(totals.totalReturn - totals.dividends + dividendsReceived, 0)}
+            color={totals.totalReturn - totals.dividends + dividendsReceived >= 0 ? COLORS.gain : COLORS.loss}
             emphasize
           />
         </div>
